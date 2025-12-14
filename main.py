@@ -116,6 +116,27 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print(f"Total training time: {total_time_str}")
 
+    #
+    # !python
+    # main.py - -data_path
+    # "/kaggle/working/data_temp1" - -dataset
+    # Dataset - -epochs
+    # 3 - -versatile_inc - -batch - size
+    # 32 - -IC - -thre
+    # 0.2 - -print_freq
+    # 50 - -beta
+    # 0.01 - -use_cast_loss - -k
+    # 3 - -d_threshold - -num_workers
+    # 4 - -model
+    # vit_base_patch16_224_in21k - -alpha
+    # 1.0 - -num_freeze_epochs = 0
+    #
+# Important understanding
+# Batch Size: can be experimented with 16 or 32
+# epochs: 100 or 150
+# Model: vit_base_patch_16_224  - suggest to use hybrid models like Swin-Unet. vit_base_patch16_224_in21k - trained on imagenet 14M dataset to identify 21K+ objects
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('LAE')
 
@@ -168,7 +189,7 @@ if __name__ == '__main__':
     parser.add_argument('--recount', type=int, default=1, help='Random erase count (default: 1)')
 
     # Data parameters
-    parser.add_argument('--data-path', default='/local_datasets/', type=str, help='dataset path')
+    parser.add_argument('--data_path', default='/local_datasets/', type=str, help='dataset path')
     parser.add_argument('--dataset', default='iDigits', type=str, help='dataset name')
     parser.add_argument('--shuffle', default=False, help='shuffle the data order')
     parser.add_argument('--output_dir', default='./output', help='path where to save, empty for no saving')
