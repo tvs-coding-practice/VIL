@@ -23,7 +23,9 @@ if os.path.exists(OUTPUT_DIR):
     shutil.rmtree(OUTPUT_DIR)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-for label in ['Cardiomegaly', 'Pneumothorax']:
+# Create folders for the 3 target classes
+TARGET_CLASSES = ['Cardiomegaly', 'Pneumothorax', 'No_Finding']
+for label in TARGET_CLASSES:
     os.makedirs(os.path.join(OUTPUT_DIR, label), exist_ok=True)
 
 # Load Data
@@ -31,7 +33,7 @@ print("Loading dataset...")
 df = pd.read_csv(os.path.join(INPUT_BASE_DIR, "train.csv"))
 initial_count = len(df)
 
-# --- NEW STRICT FILTERING LOGIC ---
+# --- STRICT FILTERING LOGIC ---
 
 # 1. Drop records where AP/PA is Empty/NaN
 df_clean = df.dropna(subset=['AP/PA']).copy()
@@ -46,20 +48,32 @@ print(f"Dropped {has_uncertainty.sum()} rows containing uncertain (-1.0) disease
 # 3. Calculate Disease Count (Positives only)
 df_clean['Disease_Count'] = df_clean[DISEASE_LABELS].eq(1.0).sum(axis=1)
 
-# 4. Filter: Exact Single Label
-single_finding_df = df_clean[df_clean['Disease_Count'] == 1].copy()
+# --- SELECTION LOGIC ---
 
-# 5. Filter: Target Classes (Cardiomegaly OR Pneumothorax)
-target_df = single_finding_df[
-    (single_finding_df['Cardiomegaly'] == 1.0) |
-    (single_finding_df['Pneumothorax'] == 1.0)
-    ].copy()
+# Condition A: Single Label Disease (Count == 1) AND (Cardiomegaly OR Pneumothorax)
+cond_disease = (
+        (df_clean['Disease_Count'] == 1) &
+        ((df_clean['Cardiomegaly'] == 1.0) | (df_clean['Pneumothorax'] == 1.0))
+)
+
+# Condition B: No Finding (Count == 0) AND (No Finding == 1.0)
+cond_no_finding = (
+        (df_clean['Disease_Count'] == 0) &
+        (df_clean['No Finding'] == 1.0)
+)
+
+# Combine selection
+target_df = df_clean[cond_disease | cond_no_finding].copy()
 
 
-# 6. Assign Label
+# 4. Assign Labels
 def get_label(row):
-    if row['Cardiomegaly'] == 1.0: return 'Cardiomegaly'
-    if row['Pneumothorax'] == 1.0: return 'Pneumothorax'
+    if row['No Finding'] == 1.0 and row['Disease_Count'] == 0:
+        return 'No_Finding'
+    elif row['Cardiomegaly'] == 1.0:
+        return 'Cardiomegaly'
+    elif row['Pneumothorax'] == 1.0:
+        return 'Pneumothorax'
     return None
 
 
@@ -67,15 +81,16 @@ target_df['Label'] = target_df.apply(get_label, axis=1)
 target_df.dropna(subset=['Label'], inplace=True)
 
 print(f"\nFinal count for processing: {len(target_df)} images.")
+print("Breakdown to be processed:")
+print(target_df['Label'].value_counts())
 
 
 # --- PROCESSING FUNCTION ---
 def process_row(row):
-    # Path setup
     try:
         relative_path_start = row['Path'].split('CheXpert-v1.0-small/')[-1]
     except AttributeError:
-        return None  # Handle malformed paths
+        return None
 
     src_path = os.path.join(INPUT_BASE_DIR, relative_path_start)
 
@@ -106,7 +121,7 @@ def process_row(row):
 metadata_list = []
 skipped_count = 0
 
-print("Starting file copy...")
+print("\nStarting file copy...")
 with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
     futures = [executor.submit(process_row, row) for _, row in target_df.iterrows()]
 
@@ -127,8 +142,8 @@ if metadata_list:
     meta_df.to_csv(save_path, index=False)
 
     print(f"\n\nDone. Successfully saved {len(meta_df)} images.")
-    print(f"Full metadata with original columns saved to: {save_path}")
-    print("\nClass Distribution:")
+    print(f"Full metadata saved to: {save_path}")
+    print("\nFinal Output Class Distribution:")
     print(meta_df['Label'].value_counts())
 else:
     print("\nNo images matched all criteria.")

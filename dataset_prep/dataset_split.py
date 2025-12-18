@@ -3,8 +3,8 @@ import random
 import shutil
 
 # --- CONFIGURATION ---
-source_folder = r"E:\vil-data\train\Domain 3\Pneumothorax"   # Use r"" for Windows paths
-destination_folder = r"E:\vil-data\test\Domain 3\Pneumothorax"
+source_folder = r"E:\vil-data\train\Domain 1\Emphysema"   # Use r"" for Windows paths
+destination_folder = r"E:\vil-data\test\Domain 1\Emphysema"
 percentage = 0.20  # 20%
 
 # 1. Get list of valid image files

@@ -73,9 +73,9 @@ def process_images_for_brisque(input_folder, output_csv, top_k_folder, k=5):
 # --- Configuration ---
 if __name__ == "__main__":
     # Update these paths
-    INPUT_DIR = "E:\VIL\processed_chestx_images\Infiltration"
+    INPUT_DIR = "E:\chexpert\Processed_Data\\No_Finding"
     OUTPUT_CSV_FILE = "brisque_scores.csv"
-    TOP_K_DESTINATION = "E:\\vil-data\\train\Domain 2\Infiltration"
+    TOP_K_DESTINATION = "E:\\vil-data\\train\Domain 3\\No_Finding"
     K_VALUE = 1000  # Number of top images to extract
 
     process_images_for_brisque(INPUT_DIR, OUTPUT_CSV_FILE, TOP_K_DESTINATION, K_VALUE)
