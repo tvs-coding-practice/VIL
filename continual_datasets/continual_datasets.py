@@ -599,3 +599,53 @@ class DomainNet(torch.utils.data.Dataset):
 
                         move(src, dst)
                 rmtree(os.path.join(self.root, test_list.split('_')[0]))
+
+
+class MedicalCXR(torch.utils.data.Dataset):
+    def __init__(self, root, train=True, transform=None, target_transform=None, download=False, mode='vil'):
+        # Assumes data is located at: root/MedicalCXR/
+        self.root = os.path.join(os.path.expanduser(root), 'MedicalCXR')
+        self.transform = transform
+        self.target_transform = target_transform
+        self.train = train
+        self.mode = mode
+        self.domains = ['NIH', 'Brachio', 'Chexpert']
+
+        # Check if root exists
+        if not os.path.exists(self.root):
+            raise RuntimeError(
+                f"Dataset root not found at {self.root}. Please ensure 'NIH', 'Brachio', and 'Chexpert' folders are inside 'MedicalCXR' folder.")
+
+        # Handle Train/Test folder structure
+        # We look for 'train'/'test' subfolders first. If not found, we assume a flat structure (root/NIH/...)
+        if self.train:
+            split_folder = os.path.join(self.root, 'train')
+        else:
+            split_folder = os.path.join(self.root, 'test')
+
+        use_split_folder = os.path.exists(split_folder)
+        base_path = split_folder if use_split_folder else self.root
+
+        # Load Data
+        if self.mode == 'vil' or self.mode == 'dil':
+            self.data = []
+            for domain in self.domains:
+                d_path = os.path.join(base_path, domain)
+                if not os.path.exists(d_path):
+                    # Fallback: check if the domain folder exists in root directly (in case user didn't make train/test splits)
+                    d_path = os.path.join(self.root, domain)
+
+                if os.path.exists(d_path):
+                    # print(f"Loading domain {domain} from {d_path}")
+                    self.data.append(datasets.ImageFolder(d_path, transform=transform))
+                else:
+                    raise RuntimeError(f"Domain folder for {domain} not found at {d_path}")
+        else:
+            # For Joint training or simple CIL, you might want to load everything as one big dataset
+            # But for your experiment, we primarily rely on the VIL list structure.
+            self.data = datasets.ImageFolder(base_path, transform=transform)
+
+    def __len__(self):
+        if isinstance(self.data, list):
+            return sum(len(d) for d in self.data)
+        return len(self.data)

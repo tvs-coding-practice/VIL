@@ -1,7 +1,8 @@
 import random
-
+import os
+import numpy as np
 import torch
-from torch.utils.data.dataset import Subset
+from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
 from torchvision import datasets, transforms
 
 from timm.data import create_transform
@@ -9,6 +10,30 @@ from timm.data import create_transform
 from continual_datasets.continual_datasets import *
 
 import utils
+
+# --- Configuration for Medical VIL ---
+MEDICAL_CLASS_MAP = {
+    'Atelectasis': 0,
+    'Emphysema': 1,
+    'Cardiomegaly': 2,
+    'Pneumothorax': 3,
+    'Edema': 4,
+    'Infiltration': 5,
+    'Effusion': 6,
+    'Nodule': 7,
+    'No_Findings': 8
+}
+
+# 6-Task Plan: NIH (CIL) -> Brachio (DIL) -> Chexpert (VIL)
+MEDICAL_TASKS_CONFIG = [
+    ('NIH', ['Atelectasis', 'Emphysema'], False),  # Task 1
+    ('NIH', ['Cardiomegaly', 'Pneumothorax'], False),  # Task 2
+    ('NIH', ['Edema', 'Infiltration'], True),  # Task 3 (Weighted: Edema < Infiltration)
+    ('NIH', ['Effusion', 'Nodule'], False),  # Task 4
+    ('Brachio', ['Effusion', 'Infiltration', 'Nodule'], True),  # Task 5 (Weighted: Effusion < others)
+    ('Chexpert', ['Cardiomegaly', 'Pneumothorax', 'No_Findings'], False)  # Task 6
+]
+
 
 class Lambda(transforms.Lambda):
     def __init__(self, lambd, nb_classes):
@@ -23,11 +48,65 @@ def target_transform(x, nb_classes):
 
 def build_continual_dataloader(args):
     dataloader = list()
-    class_mask = list() if args.task_inc or args.train_mask else None
+    class_mask = list()
+    domain_list = list()
 
     transform_train = build_transform(True, args)
     transform_val = build_transform(False, args)
 
+    # -----------------------------------------------
+    # 1. MEDICAL VIL IMPLEMENTATION
+    # -----------------------------------------------
+    if args.dataset == 'MedicalCXR':
+        # Load the MedicalCXR dataset wrapper (returns list of ImageFolders [NIH, Brachio, Chexpert])
+        # Note: We rely on the MedicalCXR class defined in continual_datasets.py
+        dataset_train_list = MedicalCXR(args.data_path, train=True, transform=transform_train, mode='vil').data
+        dataset_val_list = MedicalCXR(args.data_path, train=False, transform=transform_val, mode='vil').data
+
+        # Build the specific 6-task scenario
+        splited_dataset, class_mask, domain_list, samplers = build_medical_vil_scenario(
+            dataset_train_list, dataset_val_list, args
+        )
+
+        args.nb_classes = len(MEDICAL_CLASS_MAP)  # Total global classes (9)
+
+        # Create DataLoaders
+        for i in range(len(splited_dataset)):
+            dataset_train, dataset_val = splited_dataset[i]
+            current_sampler = samplers[i]
+
+            if current_sampler is not None:
+                sampler_train = current_sampler
+                shuffle_train = False
+            else:
+                sampler_train = torch.utils.data.RandomSampler(dataset_train)
+                shuffle_train = False
+
+            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+
+            data_loader_train = torch.utils.data.DataLoader(
+                dataset_train, sampler=sampler_train,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=args.pin_mem,
+                drop_last=False
+            )
+
+            data_loader_val = torch.utils.data.DataLoader(
+                dataset_val, sampler=sampler_val,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=args.pin_mem,
+                drop_last=False
+            )
+
+            dataloader.append({'train': data_loader_train, 'val': data_loader_val})
+
+        return dataloader, class_mask, domain_list
+
+    # -----------------------------------------------
+    # 2. STANDARD IMPLEMENTATION (Existing Code)
+    # -----------------------------------------------
     if args.task_inc:
         mode = 'til'
     elif args.domain_inc:
@@ -157,8 +236,7 @@ def build_continual_dataloader(args):
 
     if args.versatile_inc:
         splited_dataset, class_mask, domain_list, args = build_vil_scenario(splited_dataset, args)
-        for c, d in zip(class_mask, domain_list):
-            print(c, d)
+
     for i in range(len(splited_dataset)):
         dataset_train, dataset_val = splited_dataset[i]
 
@@ -207,11 +285,103 @@ def get_dataset(dataset, transform_train, transform_val, mode, args,):
     elif dataset == 'SynDigit':
         dataset_train = SynDigit(args.data_path, train=True, download=True, transform=transform_train)
         dataset_val = SynDigit(args.data_path, train=False, download=True, transform=transform_val)
-
+    # MedicalCXR is handled directly in the main function to avoid recursion or type mismatch with .data list,
+    # but could be added here if needed.
     else:
         raise ValueError('Dataset {} not found.'.format(dataset))
     
     return dataset_train, dataset_val
+
+
+def build_medical_vil_scenario(dataset_train_list, dataset_val_list, args):
+    """
+    Constructs the specific 6-task plan using the loaded domain datasets.
+    dataset_train_list: [ImageFolder(NIH), ImageFolder(Brachio), ImageFolder(Chexpert)]
+    """
+    splited_dataset = []
+    class_mask = []
+    domain_list = []
+    samplers = []
+
+    # Map domain names to list indices based on the order defined in MedicalCXR class
+    domain_idx_map = {'NIH': 0, 'Brachio': 1, 'Chexpert': 2}
+
+    for task_idx, (domain_key, target_classes, use_weighted) in enumerate(MEDICAL_TASKS_CONFIG):
+        # 1. Select the correct domain dataset
+        d_idx = domain_idx_map[domain_key]
+        full_train = dataset_train_list[d_idx]
+        full_val = dataset_val_list[d_idx]
+
+        # 2. Map Target Class Names to Source Dataset Indices
+        source_class_to_idx = full_train.class_to_idx
+
+        target_source_indices = []
+        global_ids = []
+
+        for cls_name in target_classes:
+            if cls_name not in source_class_to_idx:
+                raise ValueError(
+                    f"Class '{cls_name}' not found in {domain_key}. Available: {list(source_class_to_idx.keys())}")
+
+            target_source_indices.append(source_class_to_idx[cls_name])
+            global_ids.append(MEDICAL_CLASS_MAP[cls_name])
+
+        class_mask.append(global_ids)
+        domain_list.append(domain_key)
+
+        # 3. Create Subsets & Remap Labels
+        # Train
+        train_indices = [i for i, (_, label) in enumerate(full_train.imgs) if label in target_source_indices]
+        train_subset = Subset(full_train, train_indices)
+        train_subset = RemappedSubset(train_subset, source_class_to_idx, MEDICAL_CLASS_MAP)
+
+        # Val
+        val_indices = [i for i, (_, label) in enumerate(full_val.imgs) if label in target_source_indices]
+        val_subset = Subset(full_val, val_indices)
+        val_subset = RemappedSubset(val_subset, source_class_to_idx, MEDICAL_CLASS_MAP)
+
+        splited_dataset.append((train_subset, val_subset))
+
+        # 4. Handle Weighted Sampling
+        if use_weighted:
+            # We access the original targets via indices to calculate weights
+            subset_targets = [full_train.targets[i] for i in train_indices]
+            class_counts = {}
+            for t in subset_targets:
+                class_counts[t] = class_counts.get(t, 0) + 1
+
+            weights = []
+            for t in subset_targets:
+                weights.append(1.0 / class_counts[t])
+
+            weights = torch.DoubleTensor(weights)
+            sampler = WeightedRandomSampler(weights, len(weights))
+            samplers.append(sampler)
+        else:
+            samplers.append(None)
+
+    return splited_dataset, class_mask, domain_list, samplers
+
+
+class RemappedSubset(torch.utils.data.Dataset):
+    """
+    Wraps a Subset to remap targets from Source-Folder-IDs to Global-Experiment-IDs.
+    """
+
+    def __init__(self, subset, source_map, global_map):
+        self.subset = subset
+        self.idx_to_name = {v: k for k, v in source_map.items()}
+        self.global_map = global_map
+
+    def __getitem__(self, index):
+        x, y_source = self.subset[index]
+        class_name = self.idx_to_name[y_source]
+        y_global = self.global_map[class_name]
+        return x, y_global
+
+    def __len__(self):
+        return len(self.subset)
+
 
 def split_single_dataset(dataset_train, dataset_val, args):
     nb_classes = len(dataset_val.classes)
@@ -271,6 +441,7 @@ def build_vil_scenario(splited_dataset, args):
     splited_dataset, class_mask, domain_list = zip(*zipped)
 
     return splited_dataset, class_mask, domain_list, args
+
 
 def build_transform(is_train, args):
     if is_train:
