@@ -604,7 +604,7 @@ class DomainNet(torch.utils.data.Dataset):
 class MedicalCXR(torch.utils.data.Dataset):
     def __init__(self, root, train=True, transform=None, target_transform=None, download=False, mode='vil'):
         # Assumes data is located at: root/MedicalCXR/
-        self.root = os.path.join(os.path.expanduser(root), 'MedicalCXR')
+        self.root = os.path.join(os.path.expanduser(root), 'vil-data')
         self.transform = transform
         self.target_transform = target_transform
         self.train = train
