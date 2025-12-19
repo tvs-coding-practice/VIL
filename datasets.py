@@ -21,7 +21,7 @@ MEDICAL_CLASS_MAP = {
     'Infiltration': 5,
     'Effusion': 6,
     'Nodule': 7,
-    'No_Findings': 8
+    'No_Finding': 8
 }
 
 # 6-Task Plan: NIH (CIL) -> Brachio (DIL) -> Chexpert (VIL)
@@ -31,7 +31,7 @@ MEDICAL_TASKS_CONFIG = [
     ('NIH', ['Edema', 'Infiltration'], True),  # Task 3 (Weighted: Edema < Infiltration)
     ('NIH', ['Effusion', 'Nodule'], False),  # Task 4
     ('Brachio', ['Effusion', 'Infiltration', 'Nodule'], True),  # Task 5 (Weighted: Effusion < others)
-    ('Chexpert', ['Cardiomegaly', 'Pneumothorax', 'No_Findings'], False)  # Task 6
+    ('Chexpert', ['Cardiomegaly', 'Pneumothorax', 'No_Finding'], False)  # Task 6
 ]
 
 
