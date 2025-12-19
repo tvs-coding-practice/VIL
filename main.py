@@ -32,6 +32,9 @@ def set_data_config(args):
     elif args.dataset == "CORe50":
         args.class_num = 50
         args.domain_num = 8
+    elif args.dataset == "MedicalCXR":
+        args.class_num = 9  # Total classes in your map (0 to 8)
+        args.domain_num = 3  # NIH, Brachio, Chexpert
     return args
 
 def main(args):
