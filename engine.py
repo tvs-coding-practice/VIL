@@ -13,13 +13,77 @@ import numpy as np
 
 from timm.utils import accuracy
 from timm.optim import create_optimizer
-from timm.utils.model_ema import ModelEmaV2
 import copy
 import utils
 import torch.nn.functional as F
 from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
+
+
+class ManualEMA:
+    """Manual implementation of Exponential Moving Average for model parameters."""
+    def __init__(self, model, decay: float, device=None):
+        """
+        Args:
+            model: The model or adapter to create EMA for
+            decay: EMA decay factor (float between 0 and 1)
+            device: Device to place the EMA model on
+        """
+        self.decay = float(decay)
+        self.device = device
+        
+        # Create a deep copy of the model parameters for EMA
+        self.ema_model = copy.deepcopy(model)
+        
+        # Move to device if specified
+        if device is not None:
+            if isinstance(self.ema_model, (list, tuple)):
+                for m in self.ema_model:
+                    m.to(device)
+            else:
+                self.ema_model.to(device)
+        
+        # Set EMA model to eval mode and disable gradients
+        if isinstance(self.ema_model, (list, tuple)):
+            for m in self.ema_model:
+                m.eval()
+                for param in m.parameters():
+                    param.requires_grad = False
+        else:
+            self.ema_model.eval()
+            for param in self.ema_model.parameters():
+                param.requires_grad = False
+    
+    def update(self, model):
+        """Update EMA parameters with current model parameters."""
+        with torch.no_grad():
+            if isinstance(model, (list, tuple)) and isinstance(self.ema_model, (list, tuple)):
+                for ema_param, model_param in zip(self.ema_model, model):
+                    for ema_p, model_p in zip(ema_param.parameters(), model_param.parameters()):
+                        ema_p.data.mul_(self.decay).add_(model_p.data * (1.0 - self.decay))
+            elif isinstance(model, (list, tuple)):
+                # If model is a list but ema_model is not, we need to handle it differently
+                # This case might not occur, but handle it for safety
+                for ema_param, model_param in zip(self.ema_model.parameters(), 
+                                                  [p for m in model for p in m.parameters()]):
+                    ema_param.data.mul_(self.decay).add_(model_param.data * (1.0 - self.decay))
+            else:
+                # Standard case: both are single models
+                for ema_param, model_param in zip(self.ema_model.parameters(), model.parameters()):
+                    ema_param.data.mul_(self.decay).add_(model_param.data * (1.0 - self.decay))
+    
+    @property
+    def module(self):
+        """Return the EMA model."""
+        return self.ema_model
+    
+    def state_dict(self):
+        """Return state dict of EMA model for checkpointing."""
+        if isinstance(self.ema_model, (list, tuple)):
+            return [m.state_dict() for m in self.ema_model]
+        else:
+            return self.ema_model.state_dict()
 
 
 class Engine():
@@ -489,8 +553,7 @@ class Engine():
                 optimizer = create_optimizer(args, model)
             
             if task_id == 1 and len(args.adapt_blocks) > 0:
-                # ema_model = ModelEmaV2(model.adapter, decay=args.ema_decay).to(device)
-                ema_model = ModelEmaV2(model.get_adapter(), decay=args.ema_decay, device=device)
+                ema_model = ManualEMA(model.get_adapter(), decay=args.ema_decay, device=device)
             model, optimizer = self.pre_train_task(model, data_loader[task_id]['train'], device, task_id,args)
             for epoch in range(args.epochs):
                 model = self.pre_train_epoch(model=model, epoch=epoch, task_id=task_id, args=args,)
