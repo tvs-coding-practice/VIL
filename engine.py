@@ -298,7 +298,7 @@ class Engine():
                 if distill_loss > 0:
                     loss += distill_loss
            
-            acc1, acc5 = accuracy(logits, target, topk=(1, 5))
+            acc1, acc3 = accuracy(logits, target, topk=(1, 3))
 
             if not math.isfinite(loss.item()):
                 print("Loss is {}, stopping training".format(loss.item()))
@@ -312,7 +312,7 @@ class Engine():
             metric_logger.update(Loss=loss.item())
             metric_logger.update(Lr=optimizer.param_groups[0]["lr"])
             metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
-            metric_logger.meters['Acc@5'].update(acc5.item(), n=input.shape[0])
+            metric_logger.meters['Acc@3'].update(acc3.item(), n=input.shape[0])
 
             if ema_model is not None:
                 ema_model.update(model.get_adapter())
@@ -377,12 +377,11 @@ class Engine():
                 
                 if self.args.d_threshold and self.current_task +1 != self.args.num_tasks and self.current_task == task_id:
                     label_correct, label_total = self.update_acc_per_label(label_correct, label_total, output, target)
-                acc1, acc5 = accuracy(output, target, topk=(1, 5))
-                acc1, acc5 = accuracy(output, target, topk=(1, 5))
+                acc1, acc3 = accuracy(output, target, topk=(1, 3))
 
                 metric_logger.meters['Loss'].update(loss.item())
                 metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
-                metric_logger.meters['Acc@5'].update(acc5.item(), n=input.shape[0])
+                metric_logger.meters['Acc@3'].update(acc3.item(), n=input.shape[0])
             if total_sum>0:
                 print(f"Max Pooling acc: {correct_sum/total_sum}")
                 
@@ -393,8 +392,8 @@ class Engine():
                 print(self.acc_per_label)
         # gather the stats from all processes
         metric_logger.synchronize_between_processes()
-        print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-            .format(top1=metric_logger.meters['Acc@1'], top5=metric_logger.meters['Acc@5'], losses=metric_logger.meters['Loss']))
+        print('* Acc@1 {top1.global_avg:.3f} Acc@3 {top3.global_avg:.3f} loss {losses.global_avg:.3f}'
+            .format(top1=metric_logger.meters['Acc@1'], top3=metric_logger.meters['Acc@3'], losses=metric_logger.meters['Loss']))
 
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -402,14 +401,14 @@ class Engine():
     @torch.no_grad()
     def evaluate_till_now(self,model: torch.nn.Module, data_loader, 
                         device, task_id=-1, class_mask=None, acc_matrix=None, ema_model=None, args=None,):
-        stat_matrix = np.zeros((3, args.num_tasks)) # 3 for Acc@1, Acc@5, Loss
+        stat_matrix = np.zeros((3, args.num_tasks)) # 3 for Acc@1, Acc@3, Loss
 
         for i in range(task_id+1):
             test_stats = self.evaluate(model=model, data_loader=data_loader[i]['val'], 
                                 device=device, task_id=i, class_mask=class_mask, ema_model=ema_model, args=args)
 
             stat_matrix[0, i] = test_stats['Acc@1']
-            stat_matrix[1, i] = test_stats['Acc@5']
+            stat_matrix[1, i] = test_stats['Acc@3']
             stat_matrix[2, i] = test_stats['Loss']
 
             acc_matrix[i, task_id] = test_stats['Acc@1']
@@ -418,7 +417,7 @@ class Engine():
 
         diagonal = np.diag(acc_matrix)
 
-        result_str = "[Average accuracy till task{}]\tAcc@1: {:.4f}\tAcc@5: {:.4f}\tLoss: {:.4f}".format(task_id+1, avg_stat[0], avg_stat[1], avg_stat[2])
+        result_str = "[Average accuracy till task{}]\tAcc@1: {:.4f}\tAcc@3: {:.4f}\tLoss: {:.4f}".format(task_id+1, avg_stat[0], avg_stat[1], avg_stat[2])
         if task_id > 0:
             forgetting = np.mean((np.max(acc_matrix, axis=1) -
                                 acc_matrix[:, task_id])[:task_id])
