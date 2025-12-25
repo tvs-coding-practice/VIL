@@ -109,6 +109,24 @@ class Engine():
         
         self.class_mask=class_mask
         self.domain_list=domain_list
+        
+        # Create class name mapping for confusion matrix labels
+        # Try to get class names from args or use default mapping
+        self.class_names = {}
+        if hasattr(args, 'class_names') and args.class_names:
+            self.class_names = args.class_names
+        else:
+            # Default medical class mapping (can be overridden)
+            medical_class_map = {
+                0: 'Atelectasis', 1: 'Emphysema', 2: 'Cardiomegaly', 3: 'Pneumothorax',
+                4: 'Edema', 5: 'Infiltration', 6: 'Effusion', 7: 'Nodule', 8: 'No_Finding'
+            }
+            # Only include classes that are actually used
+            all_classes = set()
+            for mask in class_mask:
+                all_classes.update(mask)
+            self.class_names = {cls_id: medical_class_map.get(cls_id, f'Class_{cls_id}') 
+                               for cls_id in sorted(all_classes)}
 
         self.task_type="initial"
         self.args=args
@@ -414,21 +432,35 @@ class Engine():
                 all_seen_classes.extend(class_mask[i])
             all_seen_classes = sorted(list(set(all_seen_classes)))
             
-            # Filter predictions and targets to only include seen classes
-            filtered_preds = []
-            filtered_targets = []
-            for pred, targ in zip(all_predictions, all_targets):
-                # Only include samples where target is in seen classes
-                if targ in all_seen_classes:
-                    filtered_preds.append(pred)
-                    filtered_targets.append(targ)
+            # No filtering needed - predictions come from torch.max() which are always valid,
+            # and targets come from the data loader which are always valid class indices
+            # Convert to numpy arrays for sklearn
+            preds_array = np.array(all_predictions)
+            targets_array = np.array(all_targets)
             
-            if len(filtered_preds) > 0:
-                cm = confusion_matrix(filtered_targets, filtered_preds, labels=all_seen_classes)
-                print(f"\nConfusion Matrix for Task {task_id + 1} (all seen classes up to task {task_id + 1}):")
-                print("Classes:", all_seen_classes)
-                print(cm)
-                print()
+            # Compute confusion matrix - sklearn will handle any valid class indices
+            cm = confusion_matrix(targets_array, preds_array, labels=all_seen_classes)
+            
+            # Get class names for labels
+            class_labels = [self.class_names.get(cls_id, f'Class_{cls_id}') for cls_id in all_seen_classes]
+            
+            print(f"\nConfusion Matrix for Task {task_id + 1} (all seen classes up to task {task_id + 1}):")
+            print(f"Total samples: {len(all_predictions)}")
+            print(f"Classes: {all_seen_classes}")
+            print(f"Class Labels: {class_labels}")
+            print("\nConfusion Matrix (rows=actual, cols=predicted):")
+            # Print header
+            print(f"{'Actual \\ Predicted':<20}", end="")
+            for label in class_labels:
+                print(f"{label[:12]:>12}", end="")
+            print(f"{'Total':>10}")
+            # Print rows
+            for i, (label, row) in enumerate(zip(class_labels, cm)):
+                print(f"{label[:18]:<20}", end="")
+                for val in row:
+                    print(f"{val:>12}", end="")
+                print(f"{row.sum():>10}")
+            print()
 
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
