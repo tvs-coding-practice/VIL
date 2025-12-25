@@ -18,6 +18,7 @@ import utils
 import torch.nn.functional as F
 from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
+from sklearn.metrics import confusion_matrix
 import matplotlib.pyplot as plt
 
 
@@ -347,6 +348,11 @@ class Engine():
 
         correct_sum, total_sum = 0,0
         label_correct, label_total = np.zeros((self.class_group_size)), np.zeros((self.class_group_size))
+        
+        # Collect all predictions and targets for confusion matrix
+        all_predictions = []
+        all_targets = []
+        
         with torch.no_grad():
             for batch_idx,(input, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
                 if args.develop:
@@ -375,6 +381,11 @@ class Engine():
                 output = torch.stack(output_ema, dim=-1).max(dim=-1)[0]
                 loss = criterion(output, target)
                 
+                # Get predictions for confusion matrix
+                _, pred = torch.max(output, 1)
+                all_predictions.extend(pred.cpu().numpy())
+                all_targets.extend(target.cpu().numpy())
+                
                 if self.args.d_threshold and self.current_task +1 != self.args.num_tasks and self.current_task == task_id:
                     label_correct, label_total = self.update_acc_per_label(label_correct, label_total, output, target)
                 acc1, acc3 = accuracy(output, target, topk=(1, 3))
@@ -394,6 +405,30 @@ class Engine():
         metric_logger.synchronize_between_processes()
         print('* Acc@1 {top1.global_avg:.3f} Acc@3 {top3.global_avg:.3f} loss {losses.global_avg:.3f}'
             .format(top1=metric_logger.meters['Acc@1'], top3=metric_logger.meters['Acc@3'], losses=metric_logger.meters['Loss']))
+
+        # Compute and print confusion matrix
+        if len(all_predictions) > 0 and len(all_targets) > 0:
+            # Get all classes seen up to current task
+            all_seen_classes = []
+            for i in range(task_id + 1):
+                all_seen_classes.extend(class_mask[i])
+            all_seen_classes = sorted(list(set(all_seen_classes)))
+            
+            # Filter predictions and targets to only include seen classes
+            filtered_preds = []
+            filtered_targets = []
+            for pred, targ in zip(all_predictions, all_targets):
+                # Only include samples where target is in seen classes
+                if targ in all_seen_classes:
+                    filtered_preds.append(pred)
+                    filtered_targets.append(targ)
+            
+            if len(filtered_preds) > 0:
+                cm = confusion_matrix(filtered_targets, filtered_preds, labels=all_seen_classes)
+                print(f"\nConfusion Matrix for Task {task_id + 1} (all seen classes up to task {task_id + 1}):")
+                print("Classes:", all_seen_classes)
+                print(cm)
+                print()
 
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
