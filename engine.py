@@ -397,9 +397,21 @@ class Engine():
                     model.put_adapter(tmp_adapter)
                 
                 output = torch.stack(output_ema, dim=-1).max(dim=-1)[0]
+                
+                # Mask out unseen classes during evaluation (same as training)
+                # Get all classes seen up to current task
+                all_seen_classes_eval = []
+                for i in range(task_id + 1):
+                    all_seen_classes_eval.extend(class_mask[i])
+                all_seen_classes_eval = sorted(list(set(all_seen_classes_eval)))
+                not_seen_mask = np.setdiff1d(np.arange(self.num_classes), all_seen_classes_eval)
+                if len(not_seen_mask) > 0:
+                    not_seen_mask = torch.tensor(not_seen_mask, dtype=torch.int64).to(device)
+                    output = output.index_fill(dim=1, index=not_seen_mask, value=float('-inf'))
+                
                 loss = criterion(output, target)
                 
-                # Get predictions for confusion matrix
+                # Get predictions for confusion matrix (now restricted to seen classes)
                 _, pred = torch.max(output, 1)
                 all_predictions.extend(pred.cpu().numpy())
                 all_targets.extend(target.cpu().numpy())
@@ -426,27 +438,41 @@ class Engine():
 
         # Compute and print confusion matrix
         if len(all_predictions) > 0 and len(all_targets) > 0:
-            # Get all classes seen up to current task
+            # Convert to numpy arrays for sklearn
+            preds_array = np.array(all_predictions)
+            targets_array = np.array(all_targets)
+            
+            # Get all classes that actually appear in the data (targets and predictions)
+            unique_targets = np.unique(targets_array)
+            unique_preds = np.unique(preds_array)
+            classes_in_data = sorted(list(set(np.concatenate([unique_targets, unique_preds]))))
+            
+            # Get all classes seen up to current task (for display purposes)
             all_seen_classes = []
             for i in range(task_id + 1):
                 all_seen_classes.extend(class_mask[i])
             all_seen_classes = sorted(list(set(all_seen_classes)))
             
-            # No filtering needed - predictions come from torch.max() which are always valid,
-            # and targets come from the data loader which are always valid class indices
-            # Convert to numpy arrays for sklearn
-            preds_array = np.array(all_predictions)
-            targets_array = np.array(all_targets)
+            # Use classes_in_data to ensure all samples are included
+            # But also include all_seen_classes to show zeros for classes not in current task
+            display_classes = sorted(list(set(classes_in_data + all_seen_classes)))
             
-            # Compute confusion matrix - sklearn will handle any valid class indices
-            cm = confusion_matrix(targets_array, preds_array, labels=all_seen_classes)
+            # Compute confusion matrix using all classes that appear in data
+            # This ensures all samples are counted
+            cm = confusion_matrix(targets_array, preds_array, labels=display_classes)
             
             # Get class names for labels
-            class_labels = [self.class_names.get(cls_id, f'Class_{cls_id}') for cls_id in all_seen_classes]
+            class_labels = [self.class_names.get(cls_id, f'Class_{cls_id}') for cls_id in display_classes]
+            
+            # Verify total samples match
+            total_in_matrix = cm.sum()
             
             print(f"\nConfusion Matrix for Task {task_id + 1} (all seen classes up to task {task_id + 1}):")
-            print(f"Total samples: {len(all_predictions)}")
-            print(f"Classes: {all_seen_classes}")
+            print(f"Total samples collected: {len(all_predictions)}")
+            print(f"Total samples in matrix: {total_in_matrix}")
+            print(f"Classes in data: {classes_in_data}")
+            print(f"All seen classes: {all_seen_classes}")
+            print(f"Display classes: {display_classes}")
             print(f"Class Labels: {class_labels}")
             print("\nConfusion Matrix (rows=actual, cols=predicted):")
             # Print header
