@@ -220,7 +220,7 @@ if __name__ == '__main__':
     parser.add_argument('--joint_train', default=False, help='if doing joint training')
 
     # Prompt parameters
-    parser.add_argument('--adapt_blocks', default=[0, 1, 2, 3, 4])
+    parser.add_argument('--adapt_blocks', default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
     parser.add_argument('--ema_decay', type=float, default=0.9999)
     parser.add_argument('--num_freeze_epochs', type=int,default=3)
     parser.add_argument('--eval_only_emas', default=False)
