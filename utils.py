@@ -21,6 +21,89 @@ import datetime
 import torch
 import torch.distributed as dist
 
+# --------------------------------------------------------------------------
+# RanPAC Algorithm Helper Class
+# Append this to the end of utils.py
+# --------------------------------------------------------------------------
+class RanPAC_Learner:
+    def __init__(self, input_dim, projection_dim=10000, num_classes=10, device='cuda'):
+        """
+        Args:
+            input_dim (int): Dimension of the features from ViT (e.g., 768 for ViT-Base).
+            projection_dim (int): Dimension of the random projection (default 10000).
+            num_classes (int): Total number of classes (e.g., 9 for your medical dataset).
+            device (str): 'cuda' or 'cpu'.
+        """
+        self.device = device
+        self.input_dim = input_dim
+        self.projection_dim = projection_dim
+        self.num_classes = num_classes
+        
+        # 1. Random Projection Layer (W_rand)
+        # Fixed, never updated. Projects data to high-dimensional space.
+        # We use float64 (double) for higher precision during matrix inversion
+        self.W_rand = torch.randn(input_dim, projection_dim, dtype=torch.float64, device=device)
+        
+        # Normalize W_rand to keep scales consistent
+        self.W_rand = self.W_rand / torch.norm(self.W_rand, dim=0, keepdim=True)
+
+        # 2. Statistics for Closed-Form Solution (Ridge Regression)
+        # M = H^T * H (Autocorrelation Matrix of projected features)
+        self.M = torch.zeros(projection_dim, projection_dim, dtype=torch.float64, device=device) 
+        
+        # P = H^T * Y (Cross-correlation between projected features and targets)
+        self.P = torch.zeros(projection_dim, num_classes, dtype=torch.float64, device=device)
+        
+        # Regularization strength for Ridge Regression
+        self.ridge_lambda = 0.1 
+        
+        # Store the final computed weights here
+        self.W_out = None
+
+    def project(self, features):
+        """Projects features X to High-Dim Space H using W_rand. 
+           Applies ReLU activation (common in RanPAC)."""
+        # Cast to float64 for precision
+        features = features.to(dtype=torch.float64)
+        
+        # Z = X * W_rand
+        Z = torch.mm(features, self.W_rand)
+        
+        # H = ReLU(Z)
+        H = torch.nn.functional.relu(Z)
+        return H
+
+    def update_statistics(self, features, targets):
+        """Accumulates M and P matrices without training (batched update)."""
+        # 1. Get projected features H [Batch, Proj_Dim]
+        H = self.project(features) 
+        
+        # 2. Convert targets to One-Hot encoding [Batch, Num_Classes]
+        Y = torch.nn.functional.one_hot(targets, num_classes=self.num_classes).to(dtype=torch.float64, device=self.device)
+        
+        # 3. Update M (Autocorrelation): M = M + H^T * H
+        self.M += torch.mm(H.t(), H)
+        
+        # 4. Update P (Cross-correlation): P = P + H^T * Y
+        self.P += torch.mm(H.t(), Y)
+
+    def solve_weights(self):
+        """Computes the optimal weights W_out = (M + lambda*I)^-1 * P
+           using Cholesky decomposition or direct solve."""
+        identity = torch.eye(self.projection_dim, dtype=torch.float64, device=self.device)
+        
+        # Regularized M
+        M_reg = self.M + self.ridge_lambda * identity
+        
+        # Solve linear system: M_reg * W_out = P
+        # Using linalg.solve is faster and more stable than inverting the matrix
+        print("Calculating closed-form solution (this might take a moment)...")
+        self.W_out = torch.linalg.solve(M_reg, self.P)
+        
+        # Cast back to float32 for inference to save memory/speed if desired
+        self.W_out = self.W_out.float()
+        return self.W_out
+
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
     window or the global series average.

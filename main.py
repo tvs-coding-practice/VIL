@@ -68,18 +68,59 @@ def main(args):
 
     model.to(device)
 
-
-    engine = Engine(model=model,device=device, class_mask=class_mask, domain_list=domain_list, args=args)
+    # Initialize Engine
+    engine = Engine(model=model, device=device, class_mask=class_mask, domain_list=domain_list, args=args)
     
-    for n, p in model.named_parameters():
-        p.requires_grad = False
-        if 'adapter' in n:
-            p.requires_grad = True
-        if 'head' in n:
-            p.requires_grad = True
+    # -------------------------------------------------------------------------
+    # MODIFICATION: RanPAC vs Standard/CAST Setup
+    # -------------------------------------------------------------------------
+    ranpac_learner = None # Initialize variable
 
+    if args.use_ranpac:
+        print(f"RanPAC Enabled: Freezing entire model and initializing Random Projections (Dim: {args.ranpac_dim})")
+        
+        # 1. Freeze entire model (Backbone + Head)
+        for p in model.parameters():
+            p.requires_grad = False
+            
+        # 2. Initialize RanPAC Learner
+        # We assume 'utils.RanPAC_Learner' is implemented as discussed.
+        # Hardcoding input_dim=768 for ViT-Base; adjust if using different architecture.
+        ranpac_learner = utils.RanPAC_Learner(
+            input_dim=768, 
+            projection_dim=args.ranpac_dim, 
+            num_classes=args.class_num, 
+            device=device
+        )
+        
+        # 3. Skip Optimizer/Scheduler (RanPAC uses closed-form solution)
+        optimizer = None
+        lr_scheduler = None
+        
+    else:
+        # Standard / CAST Training Logic
+        for n, p in model.named_parameters():
+            p.requires_grad = False
+            if 'adapter' in n:
+                p.requires_grad = True
+            if 'head' in n:
+                p.requires_grad = True
+
+        n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print('number of params:', n_parameters)
+
+        optimizer = create_optimizer(args, model)
+
+        if args.sched != 'constant':
+            lr_scheduler, _ = create_scheduler(args, optimizer)
+        elif args.sched == 'constant':
+            lr_scheduler = None
+            
     print(args)
     
+    # -------------------------------------------------------------------------
+    # Evaluation Loop (Loading Checkpoints)
+    # -------------------------------------------------------------------------
     if args.eval:
         acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
 
@@ -97,47 +138,26 @@ def main(args):
         
         return
     
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('number of params:', n_parameters)
-
-    optimizer = create_optimizer(args, model)
-
-    if args.sched != 'constant':
-        lr_scheduler, _ = create_scheduler(args, optimizer)
-    elif args.sched == 'constant':
-        lr_scheduler = None
-
+    # -------------------------------------------------------------------------
+    # Training Loop
+    # -------------------------------------------------------------------------
     criterion = torch.nn.CrossEntropyLoss().to(device)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
 
-    engine.train_and_evaluate(model,criterion, data_loader, optimizer, 
-                       lr_scheduler, device, class_mask, args)
+    if args.use_ranpac:
+        # Run RanPAC: Single pass feature extraction + Analytic Solution
+        # Ensure 'train_ranpac' is implemented in your Engine class
+        engine.train_ranpac(model, ranpac_learner, data_loader, device, args)
+    else:
+        # Run Standard / CAST Training: Epoch-based optimization
+        engine.train_and_evaluate(model, criterion, data_loader, optimizer, 
+                                  lr_scheduler, device, class_mask, args)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print(f"Total training time: {total_time_str}")
-
-    #
-    # !python
-    # main.py - -data_path
-    # "/kaggle/working/data_temp1" - -dataset
-    # Dataset - -epochs
-    # 3 - -versatile_inc - -batch - size
-    # 32 - -IC - -thre
-    # 0.2 - -print_freq
-    # 50 - -beta
-    # 0.01 - -use_cast_loss - -k
-    # 3 - -d_threshold - -num_workers
-    # 4 - -model
-    # vit_base_patch16_224_in21k - -alpha
-    # 1.0 - -num_freeze_epochs = 0
-    #
-# Important understanding
-# Batch Size: can be experimented with 16 or 32
-# epochs: 100 or 150
-# Model: vit_base_patch_16_224  - suggest to use hybrid models like Swin-Unet. vit_base_patch16_224_in21k - trained on imagenet 14M dataset to identify 21K+ objects
 
 
 if __name__ == '__main__':
@@ -242,6 +262,11 @@ if __name__ == '__main__':
     parser.add_argument('--use_cast_loss', action='store_true', default=False, help='if using CAST loss')
     parser.add_argument('--norm_cast', action='store_true', default=False, help='if using normalization in cast')
     
+    # -------------------------------------------------------------------------
+    # RanPAC PARAMETERS
+    # -------------------------------------------------------------------------
+    parser.add_argument('--use_ranpac', action='store_true', default=False, help='Enable RanPAC training')
+    parser.add_argument('--ranpac_dim', type=int, default=10000, help='Random projection dimension for RanPAC')
    
     args = parser.parse_args()
 

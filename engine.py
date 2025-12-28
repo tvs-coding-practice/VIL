@@ -2,7 +2,7 @@ import math
 import sys
 import os
 import datetime
-import json
+import time
 from turtle import undo
 from typing import Iterable
 from pathlib import Path
@@ -685,3 +685,147 @@ class Engine():
             if args.output_dir and utils.is_main_process():
                 with open(os.path.join(args.output_dir, '{}_stats.txt'.format(datetime.datetime.now().strftime('log_%Y_%m_%d_%H_%M'))), 'a') as f:
                     f.write(json.dumps(log_stats) + '\n')
+
+    # --------------------------------------------------------------------------
+    # RanPAC Implementation Methods
+    # --------------------------------------------------------------------------
+
+    def train_ranpac(self, model: torch.nn.Module, ranpac_learner, data_loader, device, args):
+        """
+        Main driver for RanPAC training.
+        Iterates through tasks, collects statistics (M and P matrices), solves for weights,
+        and evaluates performance.
+        """
+        # Matrix to save end-of-task accuracies
+        acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
+        
+        print(f"\n[RanPAC] Starting Training for {args.num_tasks} tasks...")
+        
+        for task_id in range(args.num_tasks):
+            self.current_task = task_id
+            print(f"\n[RanPAC] Processing Task {task_id + 1}/{args.num_tasks}")
+            
+            # --- Phase 1: Feature Collection & Statistics Update ---
+            # RanPAC does not use epochs in the traditional sense. 
+            # We perform ONE pass over the current task's data to accumulate stats.
+            
+            model.eval() # Ensure backbone is frozen and in eval mode
+            train_loader = data_loader[task_id]['train']
+            
+            # Use MetricLogger for nice progress bars
+            metric_logger = utils.MetricLogger(delimiter="  ")
+            header = f'RanPAC Collection Task {task_id + 1}'
+            
+            print(f"Collecting features and updating statistics for Task {task_id}...")
+            
+            start_time = time.time()
+            for input, target in metric_logger.log_every(train_loader, args.print_freq, header):
+                input = input.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                
+                with torch.no_grad():
+                    # 1. Extract features from the frozen ViT backbone
+                    # forward_features returns [Batch, Tokens, Dim] or [Batch, Dim] depending on model
+                    features = model.forward_features(input)
+                    
+                    # If model returns sequence (Batch, Tokens, Dim), take the CLS token (index 0)
+                    if len(features.shape) == 3:
+                        features = features[:, 0]
+                    
+                    # 2. Update RanPAC statistics (M and P matrices)
+                    # This accumulates X^T*X and X^T*Y without training
+                    ranpac_learner.update_statistics(features, target)
+            
+            print(f"Feature collection finished. Time: {time.time() - start_time:.2f}s")
+            
+            # --- Phase 2: Analytic Solution (Ridge Regression) ---
+            print("Solving for optimal weights (Closed-Form Solution)...")
+            ranpac_learner.solve_weights()
+            print("Weights updated successfully.")
+            
+            # --- Phase 3: Evaluation ---
+            # Evaluate on all tasks seen so far (0 to current task_id)
+            print(f"Evaluating on tasks 0 to {task_id}...")
+            self.evaluate_ranpac_till_now(model, ranpac_learner, data_loader, device, 
+                                          task_id, acc_matrix, args)
+            
+            # Optional: Save checkpoint
+            if args.output_dir and utils.is_main_process():
+                # For RanPAC, we might want to save the learner state (M, P, W_rand)
+                # Here we stick to the basic structure
+                pass
+
+    @torch.no_grad()
+    def evaluate_ranpac(self, model, ranpac_learner, data_loader, device, task_id, args):
+        """
+        Evaluation function specifically for RanPAC.
+        Uses the projected features and calculated W_out instead of model.head.
+        """
+        metric_logger = utils.MetricLogger(delimiter="  ")
+        header = 'Test (RanPAC): [Task {}]'.format(task_id + 1)
+        
+        model.eval()
+        
+        all_preds = []
+        all_targets = []
+        
+        for input, target in metric_logger.log_every(data_loader, args.print_freq, header):
+            input = input.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+            
+            with torch.no_grad():
+                # 1. Get Features from backbone
+                features = model.forward_features(input)
+                if len(features.shape) == 3:
+                    features = features[:, 0]
+                
+                # 2. Project and Classify using RanPAC Learner
+                # H = ReLU(XW_rand)
+                projected = ranpac_learner.project(features)
+                # Logits = H @ W_out
+                logits = torch.mm(projected, ranpac_learner.W_out)
+                
+                # 3. Calculate Metrics
+                loss = torch.nn.functional.cross_entropy(logits, target)
+                acc1, acc3 = accuracy(logits, target, topk=(1, 3))
+                
+                metric_logger.meters['Loss'].update(loss.item())
+                metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
+                metric_logger.meters['Acc@3'].update(acc3.item(), n=input.shape[0])
+                
+        # Gather stats
+        metric_logger.synchronize_between_processes()
+        print('* Acc@1 {top1.global_avg:.3f} Acc@3 {top3.global_avg:.3f} loss {losses.global_avg:.3f}'
+              .format(top1=metric_logger.meters['Acc@1'], top3=metric_logger.meters['Acc@3'], losses=metric_logger.meters['Loss']))
+        
+        return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+    def evaluate_ranpac_till_now(self, model, ranpac_learner, data_loader, device, task_id, acc_matrix, args):
+        """
+        Evaluates the RanPAC model on all tasks up to the current one.
+        """
+        stat_matrix = np.zeros((3, args.num_tasks)) # Acc@1, Acc@3, Loss
+        
+        for i in range(task_id + 1):
+            test_stats = self.evaluate_ranpac(model, ranpac_learner, data_loader[i]['val'], 
+                                              device, i, args)
+            
+            stat_matrix[0, i] = test_stats['Acc@1']
+            stat_matrix[1, i] = test_stats['Acc@3']
+            stat_matrix[2, i] = test_stats['Loss']
+            
+            acc_matrix[i, task_id] = test_stats['Acc@1']
+            
+        avg_stat = np.divide(np.sum(stat_matrix, axis=1), task_id + 1)
+        
+        result_str = "[RanPAC Avg Task 0-{}]\tAcc@1: {:.4f}\tAcc@3: {:.4f}\tLoss: {:.4f}".format(
+            task_id, avg_stat[0], avg_stat[1], avg_stat[2])
+            
+        # Calculate Forgetting (if applicable, though RanPAC usually has zero forgetting if frozen)
+        if task_id > 0:
+            diagonal = np.diag(acc_matrix)
+            forgetting = np.mean((np.max(acc_matrix, axis=1) - acc_matrix[:, task_id])[:task_id])
+            result_str += "\tForgetting: {:.4f}".format(forgetting)
+            
+        print(result_str)
+        return test_stats
