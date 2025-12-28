@@ -79,6 +79,9 @@ def main(args):
     # Training Strategy: LoRA vs Adapters
     # -------------------------------------------------------------------------
     if args.use_lora:
+        print("Setting up LoRA: Unfreezing LoRA params + LayerNorms + Head")
+        utils.set_lora_trainable(model)
+
         # --- Strategy A: LoRA Training ---
         print(f"LoRA Enabled (Rank={args.lora_rank}, Alpha={args.lora_alpha}).")
         print("Freezing backbone. Unfreezing ONLY LoRA parameters and Head.")

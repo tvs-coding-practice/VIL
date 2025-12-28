@@ -242,3 +242,33 @@ def init_distributed_mode(args):
                                          world_size=args.world_size, rank=args.rank)
     torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
+
+
+def set_lora_trainable(model):
+    """
+    Unfreezes LoRA parameters AND LayerNorms.
+    Essential for Domain Adaptation performance.
+    """
+    # 1. Freeze everything first
+    for n, p in model.named_parameters():
+        p.requires_grad = False
+
+    # 2. Unfreeze LoRA, LayerNorms, and Head
+    trainable_names = []
+    for n, p in model.named_parameters():
+        # Unlock LoRA parameters
+        if 'lora_' in n:
+            p.requires_grad = True
+            trainable_names.append(n)
+
+        # Unlock LayerNorms (CRITICAL for Domain Adaptation)
+        elif 'norm' in n:  # covers norm1, norm2, fc_norm, norm_pre
+            p.requires_grad = True
+            trainable_names.append(n)
+
+        # Unlock the Classifier Head
+        elif 'head' in n:
+            p.requires_grad = True
+            trainable_names.append(n)
+
+    # print(f"Trainable params: {len(trainable_names)}")
