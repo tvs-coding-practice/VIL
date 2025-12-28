@@ -215,68 +215,41 @@ class Block(nn.Module):
 
 class VisionTransformer(nn.Module):
     """ Vision Transformer
-
     A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`
         - https://arxiv.org/abs/2010.11929
     """
 
     def __init__(
             self,
-            img_size: Union[int, Tuple[int, int]] = 224,
-            patch_size: Union[int, Tuple[int, int]] = 16,
-            in_chans: int = 3,
-            num_classes: int = 1000,
-            global_pool: str = 'token',
-            embed_dim: int = 768,
-            depth: int = 12,
-            num_heads: int = 12,
-            mlp_ratio: float = 4.,
-            qkv_bias: bool = True,
-            qk_norm: bool = False,
-            init_values: Optional[float] = None,
-            class_token: bool = True,
-            no_embed_class: bool = False,
-            pre_norm: bool = False,
-            fc_norm: Optional[bool] = None,
-            drop_rate: float = 0.,
-            pos_drop_rate: float = 0.,
-            patch_drop_rate: float = 0.,
-            proj_drop_rate: float = 0.,
-            attn_drop_rate: float = 0.,
-            drop_path_rate: float = 0.,
-            weight_init: str = '',
-            embed_layer: Callable = PatchEmbed,
-            norm_layer: Optional[Callable] = None,
-            act_layer: Optional[Callable] = None,
-            block_fn: Callable = Block,
-            mlp_layer: Callable = Mlp,
-            adapt_blocks: list = [],
+            img_size=224,
+            patch_size=16,
+            in_chans=3,
+            num_classes=1000,
+            global_pool='token',
+            embed_dim=768,
+            depth=12,
+            num_heads=12,
+            mlp_ratio=4.,
+            qkv_bias=True,
+            init_values=None,
+            class_token=True,
+            no_embed_class=False,
+            pre_norm=False,
+            fc_norm=None,
+            drop_rate=0.,
+            attn_drop_rate=0.,
+            drop_path_rate=0.,
+            weight_init='',
+            embed_layer=PatchEmbed,
+            norm_layer=None,
+            act_layer=None,
+            block_fn=Block,
+            # --- LoRA Arguments Added Here ---
+            use_lora=False,
+            lora_rank=8,
+            lora_alpha=16,
+            **kwargs,
     ):
-        """
-        Args:
-            img_size: Input image size.
-            patch_size: Patch size.
-            in_chans: Number of image input channels.
-            num_classes: Mumber of classes for classification head.
-            global_pool: Type of global pooling for final sequence (default: 'token').
-            embed_dim: Transformer embedding dimension.
-            depth: Depth of transformer.
-            num_heads: Number of attention heads.
-            mlp_ratio: Ratio of mlp hidden dim to embedding dim.
-            qkv_bias: Enable bias for qkv projections if True.
-            init_values: Layer-scale init values (layer-scale enabled if not None).
-            class_token: Use class token.
-            fc_norm: Pre head norm after pool (instead of before), if None, enabled when global_pool == 'avg'.
-            drop_rate: Head dropout rate.
-            pos_drop_rate: Position embedding dropout rate.
-            attn_drop_rate: Attention dropout rate.
-            drop_path_rate: Stochastic depth rate.
-            weight_init: Weight initialization scheme.
-            embed_layer: Patch embedding layer.
-            norm_layer: Normalization layer.
-            act_layer: MLP activation layer.
-            block_fn: Transformer block layer.
-        """
         super().__init__()
         assert global_pool in ('', 'avg', 'token')
         assert class_token or global_pool != 'token'
@@ -296,46 +269,42 @@ class VisionTransformer(nn.Module):
             patch_size=patch_size,
             in_chans=in_chans,
             embed_dim=embed_dim,
-            bias=not pre_norm,  # disable bias if pre-norm is used (e.g. CLIP)
         )
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if class_token else None
         embed_len = num_patches if no_embed_class else num_patches + self.num_prefix_tokens
         self.pos_embed = nn.Parameter(torch.randn(1, embed_len, embed_dim) * .02)
-        self.pos_drop = nn.Dropout(p=pos_drop_rate)
-        if patch_drop_rate > 0:
-            self.patch_drop = PatchDropout(
-                patch_drop_rate,
-                num_prefix_tokens=self.num_prefix_tokens,
-            )
-        else:
-            self.patch_drop = nn.Identity()
+        self.pos_drop = nn.Dropout(p=drop_rate)
         self.norm_pre = norm_layer(embed_dim) if pre_norm else nn.Identity()
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
-        self.adapt_blocks = adapt_blocks
-        # Adapter
-        # if len(adapt_blocks) > 0:
-        #     self.adapt_blocks = adapt_blocks
-        #     self.adapter = nn.ModuleList([
-        #         Adapter(embed_dim=embed_dim, mode="parallel") for _ in adapt_blocks
-        #     ])
 
+        # --- UPDATED BLOCK LOOP TO PASS LORA ARGS ---
         self.blocks = nn.Sequential(*[
-            Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
-                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                init_values=init_values,  # <--- Make sure this is passed
-                use_lora=use_lora, lora_rank=lora_rank, lora_alpha=lora_alpha  # <--- Pass LoRA args
+            block_fn(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                init_values=init_values,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[i],
+                norm_layer=norm_layer,
+                act_layer=act_layer,
+                # Pass LoRA params down to Block -> Attention
+                use_lora=use_lora,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha
             )
             for i in range(depth)])
+        # ---------------------------------------------
 
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
         # Classifier Head
         self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
-        self.head_drop = nn.Dropout(drop_rate)
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         if weight_init != 'skip':
