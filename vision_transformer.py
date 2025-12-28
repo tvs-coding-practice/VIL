@@ -824,20 +824,43 @@ def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = 
     #     model.pre_logits.fc.weight.copy_(_n2p(w[f'{prefix}pre_logits/kernel']))
     #     model.pre_logits.fc.bias.copy_(_n2p(w[f'{prefix}pre_logits/bias']))
     mha_sub, b_sub, ln1_sub = (0, 0, 1) if big_vision else (1, 3, 2)
+    
+    # Helper function to get the underlying linear layer (handles LoRA wrapping)
+    def get_linear_layer(layer):
+        """Get the actual nn.Linear layer, unwrapping LoRALinear if needed."""
+        if isinstance(layer, LoRALinear):
+            return layer.linear
+        return layer
+    
     for i, block in enumerate(model.blocks.children()):
         block_prefix = f'{prefix}Transformer/encoderblock_{i}/'
         mha_prefix = block_prefix + f'MultiHeadDotProductAttention_{mha_sub}/'
         block.norm1.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/scale']))
         block.norm1.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/bias']))
-        block.attn.qkv.weight.copy_(torch.cat([
+        
+        # Handle qkv layer (may be LoRA-wrapped)
+        qkv_layer = get_linear_layer(block.attn.qkv)
+        qkv_layer.weight.copy_(torch.cat([
             _n2p(w[f'{mha_prefix}{n}/kernel'], t=False).flatten(1).T for n in ('query', 'key', 'value')]))
-        block.attn.qkv.bias.copy_(torch.cat([
+        qkv_layer.bias.copy_(torch.cat([
             _n2p(w[f'{mha_prefix}{n}/bias'], t=False).reshape(-1) for n in ('query', 'key', 'value')]))
-        block.attn.proj.weight.copy_(_n2p(w[f'{mha_prefix}out/kernel']).flatten(1))
-        block.attn.proj.bias.copy_(_n2p(w[f'{mha_prefix}out/bias']))
+        
+        # Handle proj layer (may be LoRA-wrapped)
+        proj_layer = get_linear_layer(block.attn.proj)
+        proj_layer.weight.copy_(_n2p(w[f'{mha_prefix}out/kernel']).flatten(1))
+        proj_layer.bias.copy_(_n2p(w[f'{mha_prefix}out/bias']))
+        
+        # Handle MLP layers (may be LoRA-wrapped)
         for r in range(2):
-            getattr(block.mlp, f'fc{r + 1}').weight.copy_(_n2p(w[f'{block_prefix}MlpBlock_{b_sub}/Dense_{r}/kernel']))
-            getattr(block.mlp, f'fc{r + 1}').bias.copy_(_n2p(w[f'{block_prefix}MlpBlock_{b_sub}/Dense_{r}/bias']))
+            fc_name = f'fc{r + 1}'
+            if isinstance(block.mlp, LoRAMlp):
+                # LoRAMlp has fc1 and fc2 directly
+                fc_layer = get_linear_layer(getattr(block.mlp, fc_name))
+            else:
+                # Regular Mlp
+                fc_layer = getattr(block.mlp, fc_name)
+            fc_layer.weight.copy_(_n2p(w[f'{block_prefix}MlpBlock_{b_sub}/Dense_{r}/kernel']))
+            fc_layer.bias.copy_(_n2p(w[f'{block_prefix}MlpBlock_{b_sub}/Dense_{r}/bias']))
         block.norm2.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_{ln1_sub}/scale']))
         block.norm2.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_{ln1_sub}/bias']))
 
