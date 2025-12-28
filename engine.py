@@ -782,6 +782,8 @@ class Engine():
                 # 2. Project and Classify using RanPAC Learner
                 # H = ReLU(XW_rand)
                 projected = ranpac_learner.project(features)
+                # Cast projected to match W_out dtype (float32) to avoid dtype mismatch
+                projected = projected.to(dtype=ranpac_learner.W_out.dtype)
                 # Logits = H @ W_out
                 logits = torch.mm(projected, ranpac_learner.W_out)
                 
