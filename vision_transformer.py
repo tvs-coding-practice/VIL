@@ -181,16 +181,24 @@ class Adapter(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 init_values=None,  # <--- Existing parameter for LayerScale
-                 use_lora=False, lora_rank=8, lora_alpha=16):  # <--- New LoRA parameters
+                 init_values=None,
+                 use_lora=False, lora_rank=8, lora_alpha=16):
         super().__init__()
         self.norm1 = norm_layer(dim)
+        self.use_lora = use_lora  # Store this flag
 
-        # Pass LoRA arguments to Attention
+        # 1. Attention (Handles LoRA internally if use_lora=True)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop,
                               proj_drop=drop, use_lora=use_lora, lora_rank=lora_rank, lora_alpha=lora_alpha)
 
-        # Handle LayerScale (init_values) - standard in newer timm models
+        # 2. Adapter (Only initialize if NOT using LoRA, for backward compatibility)
+        if not use_lora:
+            # Initialize standard Parallel Adapter
+            self.adapter = Adapter(dim, mode='parallel', scale=0.1)
+        else:
+            self.adapter = None
+
+        # 3. LayerScale (Standard ViT logic)
         if init_values is not None:
             self.gamma_1 = nn.Parameter(init_values * torch.ones((dim)), requires_grad=True)
             self.gamma_2 = nn.Parameter(init_values * torch.ones((dim)), requires_grad=True)
@@ -204,15 +212,29 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x):
-        # Forward pass handling LayerScale (gamma_1/2) if present
-        if self.gamma_1 is not None:
-            x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x)))
+        # 1. Attention Block
+        if self.use_lora:
+            # LoRA path: Attention handles the adaptation internally
+            if self.gamma_1 is not None:
+                x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x)))
+            else:
+                x = x + self.drop_path(self.attn(self.norm1(x)))
+        else:
+            # Adapter/CAST path: Wrap Attention with Adapter
+            # self.adapter(module, input) -> module(input) + adapter_layer(input)
+            if self.gamma_1 is not None:
+                x = x + self.drop_path(self.gamma_1 * self.adapter(self.attn, self.norm1(x)))
+            else:
+                x = x + self.drop_path(self.adapter(self.attn, self.norm1(x)))
+
+        # 2. MLP Block
+        if self.gamma_2 is not None:
             x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
         else:
-            x = x + self.drop_path(self.attn(self.norm1(x)))
             x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
 
+        return x
+    
 class VisionTransformer(nn.Module):
     """ Vision Transformer
     A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`
@@ -244,10 +266,11 @@ class VisionTransformer(nn.Module):
             norm_layer=None,
             act_layer=None,
             block_fn=Block,
-            # --- LoRA Arguments Added Here ---
-            use_lora=False,
-            lora_rank=8,
-            lora_alpha=16,
+            # --- UPDATED ARGUMENTS ---
+            adapt_blocks=None,  # <--- Added
+            use_lora=False,  # <--- Added
+            lora_rank=8,  # <--- Added
+            lora_alpha=16,  # <--- Added
             **kwargs,
     ):
         super().__init__()
@@ -259,10 +282,15 @@ class VisionTransformer(nn.Module):
 
         self.num_classes = num_classes
         self.global_pool = global_pool
-        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+        self.num_features = self.embed_dim = embed_dim
         self.num_prefix_tokens = 1 if class_token else 0
         self.no_embed_class = no_embed_class
         self.grad_checkpointing = False
+
+        # --- Store Adaptation Config ---
+        self.adapt_blocks = adapt_blocks if adapt_blocks is not None else []
+        self.use_lora = use_lora
+        # -------------------------------
 
         self.patch_embed = embed_layer(
             img_size=img_size,
@@ -278,9 +306,8 @@ class VisionTransformer(nn.Module):
         self.pos_drop = nn.Dropout(p=drop_rate)
         self.norm_pre = norm_layer(embed_dim) if pre_norm else nn.Identity()
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
 
-        # --- UPDATED BLOCK LOOP TO PASS LORA ARGS ---
         self.blocks = nn.Sequential(*[
             block_fn(
                 dim=embed_dim,
@@ -293,25 +320,34 @@ class VisionTransformer(nn.Module):
                 drop_path=dpr[i],
                 norm_layer=norm_layer,
                 act_layer=act_layer,
-                # Pass LoRA params down to Block -> Attention
+                # Pass LoRA params
                 use_lora=use_lora,
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha
             )
             for i in range(depth)])
-        # ---------------------------------------------
 
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
-        # Classifier Head
         self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         if weight_init != 'skip':
             self.init_weights(weight_init)
-    
+
+    # --- UPDATED GET_ADAPTER METHOD ---
     def get_adapter(self):
-        return nn.ModuleList([self.blocks[i].adapter for i in self.adapt_blocks])
+        """
+        Returns the trainable adaptation modules.
+        If using LoRA, returns the QKV layers (where LoRA is injected).
+        If using Adapters, returns the adapter modules.
+        """
+        if self.use_lora:
+            # Return LoRA layers (qkv) for the adapted blocks
+            return nn.ModuleList([self.blocks[i].attn.qkv for i in self.adapt_blocks])
+        else:
+            # Fallback for standard Adapter/CAST (Assumes .adapter exists on block)
+            return nn.ModuleList([self.blocks[i].adapter for i in self.adapt_blocks])
     
     def put_adapter(self, adapter):
         for i in self.adapt_blocks:
