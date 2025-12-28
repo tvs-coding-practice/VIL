@@ -234,13 +234,12 @@ class Block(nn.Module):
             x = x + self.drop_path(self.mlp(self.norm2(x)))
 
         return x
-    
+
 class VisionTransformer(nn.Module):
     """ Vision Transformer
     A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`
         - https://arxiv.org/abs/2010.11929
     """
-
     def __init__(
             self,
             img_size=224,
@@ -266,11 +265,11 @@ class VisionTransformer(nn.Module):
             norm_layer=None,
             act_layer=None,
             block_fn=Block,
-            # --- UPDATED ARGUMENTS ---
-            adapt_blocks=None,  # <--- Added
-            use_lora=False,  # <--- Added
-            lora_rank=8,  # <--- Added
-            lora_alpha=16,  # <--- Added
+            # --- LoRA & Adapter Arguments ---
+            adapt_blocks=None,
+            use_lora=False,
+            lora_rank=8,
+            lora_alpha=16,
             **kwargs,
     ):
         super().__init__()
@@ -304,9 +303,14 @@ class VisionTransformer(nn.Module):
         embed_len = num_patches if no_embed_class else num_patches + self.num_prefix_tokens
         self.pos_embed = nn.Parameter(torch.randn(1, embed_len, embed_dim) * .02)
         self.pos_drop = nn.Dropout(p=drop_rate)
+
+        # --- FIX: Define patch_drop ---
+        self.patch_drop = nn.Identity()
+        # ------------------------------
+
         self.norm_pre = norm_layer(embed_dim) if pre_norm else nn.Identity()
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
 
         self.blocks = nn.Sequential(*[
             block_fn(
