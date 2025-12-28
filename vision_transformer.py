@@ -58,6 +58,9 @@ class Attention(nn.Module):
             attn_drop=0.,
             proj_drop=0.,
             norm_layer=nn.LayerNorm,
+            use_lora=False,
+            lora_rank=8,
+            lora_alpha=16,
     ):
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -66,11 +69,19 @@ class Attention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.fused_attn = use_fused_attn()
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        qkv_layer = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        proj_layer = nn.Linear(dim, dim)
+        
+        if use_lora:
+            self.qkv = LoRALinear(qkv_layer, rank=lora_rank, alpha=lora_alpha)
+            self.proj = LoRALinear(proj_layer, rank=lora_rank, alpha=lora_alpha)
+        else:
+            self.qkv = qkv_layer
+            self.proj = proj_layer
+            
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
 
@@ -119,6 +130,50 @@ class Scaler(nn.Module):
     def forward(self, input):
         return input * self.scale
 
+class LoRALinear(nn.Module):
+    """
+    LoRA (Low-Rank Adaptation) wrapper for Linear layers.
+    Freezes the original weight and adds trainable low-rank matrices.
+    """
+    def __init__(
+        self,
+        linear_layer: nn.Linear,
+        rank: int = 8,
+        alpha: int = 16,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.linear = linear_layer
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        
+        # Freeze the original linear layer
+        for param in self.linear.parameters():
+            param.requires_grad = False
+        
+        # Create LoRA matrices
+        in_features = linear_layer.in_features
+        out_features = linear_layer.out_features
+        
+        self.lora_A = nn.Parameter(torch.randn(rank, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        
+        # Initialize LoRA weights
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+    
+    def forward(self, x):
+        # Original forward pass
+        result = self.linear(x)
+        
+        # LoRA adaptation: x @ A^T @ B^T * scaling
+        lora_output = self.lora_dropout(x) @ self.lora_A.T @ self.lora_B.T * self.scaling
+        result = result + lora_output
+        
+        return result
+
 class Adapter(nn.Module):
     def __init__(
         self,
@@ -159,6 +214,41 @@ class Adapter(nn.Module):
             return self.layer(module(input, **kwargs)) + input
         return module(input, **kwargs) + self.layer(input)
 
+class LoRAMlp(nn.Module):
+    """
+    Wrapper for Mlp that applies LoRA to fc1 and fc2 layers.
+    """
+    def __init__(self, mlp: Mlp, lora_rank=8, lora_alpha=16):
+        super().__init__()
+        # Store original mlp for reference
+        self.original_mlp = mlp
+        
+        # Apply LoRA to fc1 and fc2 if they exist
+        if hasattr(mlp, 'fc1'):
+            self.fc1 = LoRALinear(mlp.fc1, rank=lora_rank, alpha=lora_alpha)
+        else:
+            self.fc1 = mlp.fc1 if hasattr(mlp, 'fc1') else None
+            
+        if hasattr(mlp, 'fc2'):
+            self.fc2 = LoRALinear(mlp.fc2, rank=lora_rank, alpha=lora_alpha)
+        else:
+            self.fc2 = mlp.fc2 if hasattr(mlp, 'fc2') else None
+        
+        # Copy other attributes from original mlp
+        for attr in ['act', 'drop1', 'drop2']:
+            if hasattr(mlp, attr):
+                setattr(self, attr, getattr(mlp, attr))
+    
+    def forward(self, x):
+        # Replicate the original Mlp forward pass
+        x = self.fc1(x)
+        x = self.act(x) if hasattr(self, 'act') else x
+        x = self.drop1(x) if hasattr(self, 'drop1') else x
+        x = self.fc2(x)
+        x = self.drop2(x) if hasattr(self, 'drop2') else x
+        return x
+        return x
+
 class Block(nn.Module):
 
     def __init__(
@@ -176,6 +266,9 @@ class Block(nn.Module):
             norm_layer=nn.LayerNorm,
             mlp_layer=Mlp,
             adapt_blocks=None,
+            use_lora=False,
+            lora_rank=8,
+            lora_alpha=16,
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -187,30 +280,37 @@ class Block(nn.Module):
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             norm_layer=norm_layer,
+            use_lora=use_lora,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
         )
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.norm2 = norm_layer(dim)
-        self.mlp = mlp_layer(
+        mlp_base = mlp_layer(
             in_features=dim,
             hidden_features=int(dim * mlp_ratio),
             act_layer=act_layer,
             drop=proj_drop,
         )
+        
+        if use_lora:
+            self.mlp = LoRAMlp(mlp_base, lora_rank=lora_rank, lora_alpha=lora_alpha)
+        else:
+            self.mlp = mlp_base
+            
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-        # if adapt_blocks is not None:
-        #     # self.adapter = adapt_blocks
-        if adapt_blocks:
+        # Legacy adapter support (deprecated, use LoRA instead)
+        if adapt_blocks and not use_lora:
             self.adapter = Adapter(embed_dim=dim, mode="parallel")
+        self.use_lora = use_lora
 
     def forward(self, x):
-        if hasattr(self, "adapter"):
-            x = x + self.drop_path1(self.ls1(self.adapter(self.attn, self.norm1(x))))
-        else:
-            x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        # Standard forward pass (works for both LoRA and adapter)
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
@@ -252,6 +352,9 @@ class VisionTransformer(nn.Module):
             block_fn: Callable = Block,
             mlp_layer: Callable = Mlp,
             adapt_blocks: list = [],
+            use_lora: bool = False,
+            lora_rank: int = 8,
+            lora_alpha: int = 16,
     ):
         """
         Args:
@@ -316,13 +419,10 @@ class VisionTransformer(nn.Module):
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.adapt_blocks = adapt_blocks
-        # Adapter
-        # if len(adapt_blocks) > 0:
-        #     self.adapt_blocks = adapt_blocks
-        #     self.adapter = nn.ModuleList([
-        #         Adapter(embed_dim=embed_dim, mode="parallel") for _ in adapt_blocks
-        #     ])
+        self.use_lora = use_lora
         
+        # If LoRA is enabled, use it for all blocks in adapt_blocks
+        # Otherwise, fall back to legacy adapters
         self.blocks = nn.Sequential(*[
             block_fn(
                 dim=embed_dim,
@@ -338,6 +438,9 @@ class VisionTransformer(nn.Module):
                 act_layer=act_layer,
                 mlp_layer=mlp_layer,
                 adapt_blocks=True if i in adapt_blocks else False,
+                use_lora=use_lora if i in adapt_blocks else False,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
             )
             for i in range(depth)])
 
@@ -352,11 +455,66 @@ class VisionTransformer(nn.Module):
             self.init_weights(weight_init)
     
     def get_adapter(self):
-        return nn.ModuleList([self.blocks[i].adapter for i in self.adapt_blocks])
+        """
+        Get adapters or LoRA parameters from blocks.
+        Returns a ModuleList for compatibility with existing code.
+        For LoRA, returns a ModuleList containing all LoRA modules.
+        """
+        if self.use_lora:
+            # Collect all LoRA modules from blocks
+            lora_modules = []
+            for i in self.adapt_blocks:
+                block = self.blocks[i]
+                # Collect LoRA from attention (qkv and proj)
+                if hasattr(block.attn, 'qkv') and isinstance(block.attn.qkv, LoRALinear):
+                    lora_modules.append(block.attn.qkv)
+                if hasattr(block.attn, 'proj') and isinstance(block.attn.proj, LoRALinear):
+                    lora_modules.append(block.attn.proj)
+                # Collect LoRA from MLP (fc1 and fc2)
+                if isinstance(block.mlp, LoRAMlp):
+                    if hasattr(block.mlp, 'fc1') and isinstance(block.mlp.fc1, LoRALinear):
+                        lora_modules.append(block.mlp.fc1)
+                    if hasattr(block.mlp, 'fc2') and isinstance(block.mlp.fc2, LoRALinear):
+                        lora_modules.append(block.mlp.fc2)
+            return nn.ModuleList(lora_modules)
+        else:
+            # Legacy adapter support
+            return nn.ModuleList([self.blocks[i].adapter for i in self.adapt_blocks if hasattr(self.blocks[i], 'adapter')])
     
     def put_adapter(self, adapter):
-        for i in self.adapt_blocks:
-            self.blocks[i].adapter = adapter[i]
+        """
+        Put adapters or LoRA parameters back into blocks.
+        For LoRA, expects a ModuleList of LoRA modules in the same order as get_adapter.
+        """
+        if self.use_lora:
+            # Distribute LoRA modules back to blocks
+            idx = 0
+            for i in self.adapt_blocks:
+                block = self.blocks[i]
+                # Restore LoRA to attention
+                if hasattr(block.attn, 'qkv') and isinstance(block.attn.qkv, LoRALinear):
+                    if idx < len(adapter):
+                        block.attn.qkv = adapter[idx]
+                        idx += 1
+                if hasattr(block.attn, 'proj') and isinstance(block.attn.proj, LoRALinear):
+                    if idx < len(adapter):
+                        block.attn.proj = adapter[idx]
+                        idx += 1
+                # Restore LoRA to MLP
+                if isinstance(block.mlp, LoRAMlp):
+                    if hasattr(block.mlp, 'fc1') and isinstance(block.mlp.fc1, LoRALinear):
+                        if idx < len(adapter):
+                            block.mlp.fc1 = adapter[idx]
+                            idx += 1
+                    if hasattr(block.mlp, 'fc2') and isinstance(block.mlp.fc2, LoRALinear):
+                        if idx < len(adapter):
+                            block.mlp.fc2 = adapter[idx]
+                            idx += 1
+        else:
+            # Legacy adapter support
+            for i, adapter_module in zip(self.adapt_blocks, adapter):
+                if hasattr(self.blocks[i], 'adapter'):
+                    self.blocks[i].adapter = adapter_module
     
     def init_weights(self, mode=''):
         assert mode in ('jax', 'jax_nlhb', 'moco', '')

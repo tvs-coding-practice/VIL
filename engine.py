@@ -543,17 +543,22 @@ class Engine():
         if task_id == 0 or args.num_freeze_epochs < 1:
             return model
         
+        # Check for LoRA or adapter parameters
+        param_pattern = 'lora_' if getattr(args, 'use_lora', False) else 'adapter'
+        
         if epoch == 0:
             for n, p in model.named_parameters():
-                if 'adapter' in n:
+                if param_pattern in n:
                     p.requires_grad = False
-            print('Freezing adapter parameters for {} epochs'.format(args.num_freeze_epochs))
+            param_type = 'LoRA' if getattr(args, 'use_lora', False) else 'adapter'
+            print(f'Freezing {param_type} parameters for {args.num_freeze_epochs} epochs')
 
         if epoch == args.num_freeze_epochs:
             for n, p in model.named_parameters():
-                if 'adapter' in n:
+                if param_pattern in n:
                     p.requires_grad = True
-            print('Unfreezing adapter parameters')        
+            param_type = 'LoRA' if getattr(args, 'use_lora', False) else 'adapter'
+            print(f'Unfreezing {param_type} parameters')        
         return model
     
     

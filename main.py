@@ -1,5 +1,5 @@
 import sys
-import argparse 
+import argparse
 import datetime
 import random
 import numpy as np
@@ -33,7 +33,7 @@ def set_data_config(args):
         args.class_num = 50
         args.domain_num = 8
     elif args.dataset == "MedicalCXR":
-        args.class_num = 9  # Total classes in your map (0 to 8)
+        args.class_num = 9  # Total classes (0 to 8)
         args.domain_num = 3  # NIH, Brachio, Chexpert
     return args
 
@@ -52,10 +52,12 @@ def main(args):
     cudnn.benchmark = True
     cudnn.deterministic = True
     
-    
     data_loader, class_mask, domain_list = build_continual_dataloader(args)
    
-
+    # -------------------------------------------------------------------------
+    # Model Creation
+    # -------------------------------------------------------------------------
+    print(f"Creating model: {args.model}")
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -64,22 +66,71 @@ def main(args):
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
         adapt_blocks=args.adapt_blocks,
+        # Pass LoRA arguments to the model init
+        use_lora=args.use_lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha
     )
 
     model.to(device)
 
-
-    engine = Engine(model=model,device=device, class_mask=class_mask, domain_list=domain_list, args=args)
+    # Initialize Engine
+    engine = Engine(model=model, device=device, class_mask=class_mask, domain_list=domain_list, args=args)
     
-    for n, p in model.named_parameters():
-        p.requires_grad = False
-        if 'adapter' in n:
-            p.requires_grad = True
-        if 'head' in n:
-            p.requires_grad = True
+    # -------------------------------------------------------------------------
+    # Training Strategy: LoRA vs Adapters
+    # -------------------------------------------------------------------------
+    if args.use_lora:
+        # --- Strategy A: LoRA Training ---
+        print(f"LoRA Enabled (Rank={args.lora_rank}, Alpha={args.lora_alpha}).")
+        print("Freezing backbone. Unfreezing LoRA parameters, HEAD, and LAYER NORMS.")
+        
+        # 1. Freeze EVERYTHING first
+        for p in model.parameters():
+            p.requires_grad = False
+            
+        # 2. Unfreeze specific parts
+        trainable_params = []
+        for n, p in model.named_parameters():
+            if 'lora_' in n: # Matches lora_A and lora_B
+                p.requires_grad = True
+                trainable_params.append(n)
+            elif 'head' in n: # Always train the classifier head
+                p.requires_grad = True
+                trainable_params.append(n)
+            elif 'norm' in n: # <--- CRITICAL FIX: Train LayerNorms
+                p.requires_grad = True
+                trainable_params.append(n)
+        
+        print(f"Total trainable tensors: {len(trainable_params)}")
 
+    else:
+        # --- Strategy B: Original Adapter / Partial Fine-tuning ---
+        print("Standard Training: Using Adapters/Partial Freezing")
+        for n, p in model.named_parameters():
+            p.requires_grad = False
+            if 'adapter' in n:
+                p.requires_grad = True
+            if 'head' in n:
+                p.requires_grad = True
+
+    # Count parameters
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print('Number of trainable params:', n_parameters)
+
+    # Create Optimizer and Scheduler
+    optimizer = create_optimizer(args, model)
+
+    if args.sched != 'constant':
+        lr_scheduler, _ = create_scheduler(args, optimizer)
+    elif args.sched == 'constant':
+        lr_scheduler = None
+            
     print(args)
     
+    # -------------------------------------------------------------------------
+    # Evaluation Loop
+    # -------------------------------------------------------------------------
     if args.eval:
         acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
 
@@ -92,52 +143,25 @@ def main(args):
             else:
                 print('No checkpoint found at:', checkpoint_path)
                 return
+            
             _ = engine.evaluate_till_now(model, data_loader, device, 
                                             task_id, class_mask, acc_matrix, args,)
-        
         return
     
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('number of params:', n_parameters)
-
-    optimizer = create_optimizer(args, model)
-
-    if args.sched != 'constant':
-        lr_scheduler, _ = create_scheduler(args, optimizer)
-    elif args.sched == 'constant':
-        lr_scheduler = None
-
+    # -------------------------------------------------------------------------
+    # Training Loop
+    # -------------------------------------------------------------------------
     criterion = torch.nn.CrossEntropyLoss().to(device)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
 
-    engine.train_and_evaluate(model,criterion, data_loader, optimizer, 
-                       lr_scheduler, device, class_mask, args)
+    engine.train_and_evaluate(model, criterion, data_loader, optimizer, 
+                              lr_scheduler, device, class_mask, args)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print(f"Total training time: {total_time_str}")
-
-    #
-    # !python
-    # main.py - -data_path
-    # "/kaggle/working/data_temp1" - -dataset
-    # Dataset - -epochs
-    # 3 - -versatile_inc - -batch - size
-    # 32 - -IC - -thre
-    # 0.2 - -print_freq
-    # 50 - -beta
-    # 0.01 - -use_cast_loss - -k
-    # 3 - -d_threshold - -num_workers
-    # 4 - -model
-    # vit_base_patch16_224_in21k - -alpha
-    # 1.0 - -num_freeze_epochs = 0
-    #
-# Important understanding
-# Batch Size: can be experimented with 16 or 32
-# epochs: 100 or 150
-# Model: vit_base_patch_16_224  - suggest to use hybrid models like Swin-Unet. vit_base_patch16_224_in21k - trained on imagenet 14M dataset to identify 21K+ objects
 
 
 if __name__ == '__main__':
@@ -219,7 +243,7 @@ if __name__ == '__main__':
     parser.add_argument('--versatile_inc', action='store_true', default=False, help='if doing versatile incremental')
     parser.add_argument('--joint_train', default=False, help='if doing joint training')
 
-    # Prompt parameters
+    # Prompt / Adapter parameters
     parser.add_argument('--adapt_blocks', default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
     parser.add_argument('--ema_decay', type=float, default=0.9999)
     parser.add_argument('--num_freeze_epochs', type=int,default=3)
@@ -242,8 +266,21 @@ if __name__ == '__main__':
     parser.add_argument('--use_cast_loss', action='store_true', default=False, help='if using CAST loss')
     parser.add_argument('--norm_cast', action='store_true', default=False, help='if using normalization in cast')
     
-   
+    # -------------------------------------------------------------------------
+    # LoRA PARAMETERS (LoRA is now the default method)
+    # -------------------------------------------------------------------------
+    parser.add_argument('--use_lora', action='store_true', help='Use LoRA instead of Adapters')
+    parser.add_argument('--lora_rank', type=int, default=8, help='Rank of LoRA matrices (default: 8)')
+    parser.add_argument('--lora_alpha', type=int, default=16, help='Scaling factor for LoRA (default: 16)')
+    parser.add_argument('--use_adapters', action='store_true', default=False, help='Use legacy Adapters instead of LoRA (deprecated)')
+
     args = parser.parse_args()
+    
+    # LoRA is enabled by default unless --use_adapters is explicitly set
+    if not args.use_adapters and not args.use_lora:
+        args.use_lora = True  # Default to LoRA
+    elif args.use_adapters:
+        args.use_lora = False  # Explicitly disable LoRA if adapters are requested
 
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
