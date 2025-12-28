@@ -20,7 +20,9 @@ import utils
 import os
 
 import warnings
+
 warnings.filterwarnings('ignore', 'Argument interpolation should be of type InterpolationMode instead of int')
+
 
 def set_data_config(args):
     if args.dataset == "iDigits":
@@ -37,6 +39,7 @@ def set_data_config(args):
         args.domain_num = 3  # NIH, Brachio, Chexpert
     return args
 
+
 def main(args):
     # utils.init_distributed_mode(args)
     args.distributed = False
@@ -51,11 +54,13 @@ def main(args):
 
     cudnn.benchmark = True
     cudnn.deterministic = True
-    
-    
-    data_loader, class_mask, domain_list = build_continual_dataloader(args)
-   
 
+    data_loader, class_mask, domain_list = build_continual_dataloader(args)
+
+    # -------------------------------------------------------------------------
+    # Model Creation
+    # -------------------------------------------------------------------------
+    print(f"Creating model: {args.model}")
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -79,28 +84,28 @@ def main(args):
     # Training Strategy: LoRA vs Adapters
     # -------------------------------------------------------------------------
     if args.use_lora:
-        print("Setting up LoRA: Unfreezing LoRA params + LayerNorms + Head")
-        utils.set_lora_trainable(model)
-
         # --- Strategy A: LoRA Training ---
         print(f"LoRA Enabled (Rank={args.lora_rank}, Alpha={args.lora_alpha}).")
-        print("Freezing backbone. Unfreezing ONLY LoRA parameters and Head.")
-
+        print("Freezing backbone. Unfreezing LoRA parameters, HEAD, and LAYER NORMS.")
+        utils.set_lora_trainable(model)
         # 1. Freeze EVERYTHING first
         for p in model.parameters():
             p.requires_grad = False
 
-        # 2. Unfreeze ONLY LoRA parameters and the Head
+        # 2. Unfreeze specific parts
+        trainable_params = []
         for n, p in model.named_parameters():
             if 'lora_' in n:  # Matches lora_A and lora_B
                 p.requires_grad = True
+                trainable_params.append(n)
             elif 'head' in n:  # Always train the classifier head
                 p.requires_grad = True
+                trainable_params.append(n)
+            elif 'norm' in n:  # <--- CRITICAL FIX: Train LayerNorms
+                p.requires_grad = True
+                trainable_params.append(n)
 
-        # Optional: If you use LayerNorm tuning (often good for ViT), unfreeze norms
-        # for n, p in model.named_parameters():
-        #     if 'norm' in n:
-        #         p.requires_grad = True
+        print(f"Total trainable tensors: {len(trainable_params)}")
 
     else:
         # --- Strategy B: Original Adapter / Partial Fine-tuning ---
@@ -125,7 +130,10 @@ def main(args):
         lr_scheduler = None
 
     print(args)
-    
+
+    # -------------------------------------------------------------------------
+    # Evaluation Loop
+    # -------------------------------------------------------------------------
     if args.eval:
         acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
 
@@ -151,7 +159,6 @@ def main(args):
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
 
-    # Run Standard / CAST / LoRA Training: Epoch-based optimization
     engine.train_and_evaluate(model, criterion, data_loader, optimizer,
                               lr_scheduler, device, class_mask, args)
 
