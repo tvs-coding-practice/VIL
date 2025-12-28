@@ -334,6 +334,7 @@ class VisionTransformer(nn.Module):
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
         self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
+        self.head_drop = nn.Dropout(p=drop_rate)
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         if weight_init != 'skip':
