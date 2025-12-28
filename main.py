@@ -1,5 +1,5 @@
 import sys
-import argparse 
+import argparse
 import datetime
 import random
 import numpy as np
@@ -33,7 +33,7 @@ def set_data_config(args):
         args.class_num = 50
         args.domain_num = 8
     elif args.dataset == "MedicalCXR":
-        args.class_num = 9  # Total classes in your map (0 to 8)
+        args.class_num = 9  # Total classes (0 to 8)
         args.domain_num = 3  # NIH, Brachio, Chexpert
     return args
 
@@ -64,42 +64,56 @@ def main(args):
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
         adapt_blocks=args.adapt_blocks,
+        # Pass LoRA arguments to the model init
+        use_lora=args.use_lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha
     )
 
     model.to(device)
 
+    # Initialize Engine
+    engine = Engine(model=model, device=device, class_mask=class_mask, domain_list=domain_list, args=args)
 
-    engine = Engine(model=model,device=device, class_mask=class_mask, domain_list=domain_list, args=args)
-    
-    for n, p in model.named_parameters():
-        p.requires_grad = False
-        if 'adapter' in n:
-            p.requires_grad = True
-        if 'head' in n:
-            p.requires_grad = True
+    # -------------------------------------------------------------------------
+    # Training Strategy: LoRA vs Adapters
+    # -------------------------------------------------------------------------
+    if args.use_lora:
+        # --- Strategy A: LoRA Training ---
+        print(f"LoRA Enabled (Rank={args.lora_rank}, Alpha={args.lora_alpha}).")
+        print("Freezing backbone. Unfreezing ONLY LoRA parameters and Head.")
 
-    print(args)
-    
-    if args.eval:
-        acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
+        # 1. Freeze EVERYTHING first
+        for p in model.parameters():
+            p.requires_grad = False
 
-        for task_id in range(args.num_tasks):
-            checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))
-            if os.path.exists(checkpoint_path):
-                print('Loading checkpoint from:', checkpoint_path)
-                checkpoint = torch.load(checkpoint_path)
-                model.load_state_dict(checkpoint['model'])
-            else:
-                print('No checkpoint found at:', checkpoint_path)
-                return
-            _ = engine.evaluate_till_now(model, data_loader, device, 
-                                            task_id, class_mask, acc_matrix, args,)
-        
-        return
-    
+        # 2. Unfreeze ONLY LoRA parameters and the Head
+        for n, p in model.named_parameters():
+            if 'lora_' in n:  # Matches lora_A and lora_B
+                p.requires_grad = True
+            elif 'head' in n:  # Always train the classifier head
+                p.requires_grad = True
+
+        # Optional: If you use LayerNorm tuning (often good for ViT), unfreeze norms
+        # for n, p in model.named_parameters():
+        #     if 'norm' in n:
+        #         p.requires_grad = True
+
+    else:
+        # --- Strategy B: Original Adapter / Partial Fine-tuning ---
+        print("Standard Training: Using Adapters/Partial Freezing")
+        for n, p in model.named_parameters():
+            p.requires_grad = False
+            if 'adapter' in n:
+                p.requires_grad = True
+            if 'head' in n:
+                p.requires_grad = True
+
+    # Count parameters
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('number of params:', n_parameters)
+    print('Number of trainable params:', n_parameters)
 
+    # Create Optimizer and Scheduler
     optimizer = create_optimizer(args, model)
 
     if args.sched != 'constant':
@@ -107,37 +121,40 @@ def main(args):
     elif args.sched == 'constant':
         lr_scheduler = None
 
+    print(args)
+    
+    if args.eval:
+        acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
+
+        for task_id in range(args.num_tasks):
+            checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id + 1))
+            if os.path.exists(checkpoint_path):
+                print('Loading checkpoint from:', checkpoint_path)
+                checkpoint = torch.load(checkpoint_path)
+                model.load_state_dict(checkpoint['model'])
+            else:
+                print('No checkpoint found at:', checkpoint_path)
+                return
+
+            _ = engine.evaluate_till_now(model, data_loader, device,
+                                         task_id, class_mask, acc_matrix, args, )
+        return
+
+    # -------------------------------------------------------------------------
+    # Training Loop
+    # -------------------------------------------------------------------------
     criterion = torch.nn.CrossEntropyLoss().to(device)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
 
-    engine.train_and_evaluate(model,criterion, data_loader, optimizer, 
-                       lr_scheduler, device, class_mask, args)
+    # Run Standard / CAST / LoRA Training: Epoch-based optimization
+    engine.train_and_evaluate(model, criterion, data_loader, optimizer,
+                              lr_scheduler, device, class_mask, args)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print(f"Total training time: {total_time_str}")
-
-    #
-    # !python
-    # main.py - -data_path
-    # "/kaggle/working/data_temp1" - -dataset
-    # Dataset - -epochs
-    # 3 - -versatile_inc - -batch - size
-    # 32 - -IC - -thre
-    # 0.2 - -print_freq
-    # 50 - -beta
-    # 0.01 - -use_cast_loss - -k
-    # 3 - -d_threshold - -num_workers
-    # 4 - -model
-    # vit_base_patch16_224_in21k - -alpha
-    # 1.0 - -num_freeze_epochs = 0
-    #
-# Important understanding
-# Batch Size: can be experimented with 16 or 32
-# epochs: 100 or 150
-# Model: vit_base_patch_16_224  - suggest to use hybrid models like Swin-Unet. vit_base_patch16_224_in21k - trained on imagenet 14M dataset to identify 21K+ objects
 
 
 if __name__ == '__main__':
@@ -228,21 +245,27 @@ if __name__ == '__main__':
     # Misc parameters
     parser.add_argument('--print_freq', type=int, default=10, help = 'The frequency of printing')
     parser.add_argument('--develop', action='store_true', default=False)
-    
-     #! IC
+
+    # ! IC
     parser.add_argument('--IC', action='store_true', default=False, help='if using incremental classifier')
     parser.add_argument('--d_threshold', action='store_true', default=False, help='if using dynamic thresholding in IC')
     parser.add_argument('--gamma',default=10.0, type=float, help='coefficient in dynamic thresholding')
     parser.add_argument('--thre',default=0, type=float, help='value of static threshold if not using dynamic thresholding')
     parser.add_argument('--alpha',default=1.0, type=float, help='coefficient of knowledge distillation in IC loss')
 
-    #! CAST
-    parser.add_argument('--beta',default=0.001, type=float, help='coefficient of cast loss')
+    # ! CAST
+    parser.add_argument('--beta', default=0.001, type=float, help='coefficient of cast loss')
     parser.add_argument('--k', default=2, type=int, help='the number of clusters in shift pool')
     parser.add_argument('--use_cast_loss', action='store_true', default=False, help='if using CAST loss')
     parser.add_argument('--norm_cast', action='store_true', default=False, help='if using normalization in cast')
-    
-   
+
+    # -------------------------------------------------------------------------
+    # LoRA PARAMETERS
+    # -------------------------------------------------------------------------
+    parser.add_argument('--use_lora', action='store_true', default=False, help='Use LoRA instead of Adapters')
+    parser.add_argument('--lora_rank', type=int, default=8, help='Rank of LoRA matrices')
+    parser.add_argument('--lora_alpha', type=int, default=16, help='Scaling factor for LoRA')
+
     args = parser.parse_args()
 
     if args.output_dir:
