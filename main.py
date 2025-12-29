@@ -78,6 +78,23 @@ def main(args):
     engine = Engine(model=model, device=device, class_mask=class_mask, domain_list=domain_list, args=args)
     
     # -------------------------------------------------------------------------
+    # Ensure head is properly initialized (especially after loading pretrained weights)
+    # -------------------------------------------------------------------------
+    if hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear):
+        # Check if head bias is all zeros (proper initialization) or has problematic values
+        head_bias_mean = model.head.bias.abs().mean().item()
+        head_weight_mean = model.head.weight.abs().mean().item()
+        
+        # If head seems improperly initialized (bias too large or weights too small), re-initialize
+        if head_bias_mean > 0.01 or head_weight_mean < 0.001:
+            print(f"Re-initializing head: bias_mean={head_bias_mean:.6f}, weight_mean={head_weight_mean:.6f}")
+            # Re-initialize head with proper values
+            torch.nn.init.trunc_normal_(model.head.weight, std=0.02)
+            torch.nn.init.zeros_(model.head.bias)
+            print(f"Head re-initialized: new bias_mean={model.head.bias.abs().mean().item():.6f}, "
+                  f"new weight_mean={model.head.weight.abs().mean().item():.6f}")
+    
+    # -------------------------------------------------------------------------
     # Training Strategy: LoRA vs Adapters
     # -------------------------------------------------------------------------
     if args.use_lora:
@@ -117,9 +134,36 @@ def main(args):
     # Count parameters
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('Number of trainable params:', n_parameters)
+    
+    # Verify head is trainable
+    if hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear):
+        head_trainable = any(p.requires_grad for p in model.head.parameters())
+        print(f'Head is trainable: {head_trainable}')
+        if head_trainable:
+            head_params = sum(p.numel() for p in model.head.parameters() if p.requires_grad)
+            print(f'Head parameters: {head_params}')
 
     # Create Optimizer and Scheduler
     optimizer = create_optimizer(args, model)
+    
+    # Verify head is in optimizer
+    if hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear):
+        head_in_optimizer = False
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                if id(p) == id(model.head.weight) or id(p) == id(model.head.bias):
+                    head_in_optimizer = True
+                    break
+            if head_in_optimizer:
+                break
+        print(f'Head parameters in optimizer: {head_in_optimizer}')
+        if not head_in_optimizer:
+            print('WARNING: Head parameters may not be in optimizer!')
+            # Manually add head to optimizer if needed
+            head_params = [p for p in model.head.parameters() if p.requires_grad]
+            if head_params:
+                optimizer.add_param_group({'params': head_params, 'lr': optimizer.param_groups[0]['lr']})
+                print('Added head parameters to optimizer manually')
 
     if args.sched != 'constant':
         lr_scheduler, _ = create_scheduler(args, optimizer)
