@@ -288,7 +288,13 @@ class Engine():
 
             loss = criterion(logits, target) # (bs, class), (bs)
             
-           
+            # Add head bias regularization to prevent biased predictions
+            # This penalizes large head bias values to ensure the model relies on features, not bias
+            if hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear) and model.head.bias is not None:
+                # L2 regularization on head bias - encourage it to stay near zero
+                head_bias_reg = 0.001 * torch.sum(model.head.bias ** 2)
+                loss = loss + head_bias_reg
+            
             if self.args.use_cast_loss:
                 if len(self.adapter_vec)> args.k: 
                     cur_adapters = model.get_adapter()
@@ -584,6 +590,15 @@ class Engine():
     
     def pre_train_task(self, model, data_loader, device, task_id, args):
         self.current_task += 1
+        
+        # Re-initialize head bias at the start of each task to prevent bias accumulation
+        if task_id == 0 and hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear):
+            # Check if head bias is already biased
+            head_bias_abs_mean = model.head.bias.abs().mean().item()
+            if head_bias_abs_mean > 0.01:
+                print(f"Task {task_id}: Re-initializing head bias (current mean={head_bias_abs_mean:.6f})")
+                torch.nn.init.zeros_(model.head.bias)
+                print(f"Head bias re-initialized to zeros")
         self.current_class_group = int(min(self.class_mask[task_id])/self.class_group_size)
         self.class_group_list.append(self.current_class_group)
         self.current_classes = self.class_mask[task_id]

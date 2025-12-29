@@ -157,13 +157,26 @@ def main(args):
             if head_in_optimizer:
                 break
         print(f'Head parameters in optimizer: {head_in_optimizer}')
-        if not head_in_optimizer:
-            print('WARNING: Head parameters may not be in optimizer!')
-            # Manually add head to optimizer if needed
-            head_params = [p for p in model.head.parameters() if p.requires_grad]
-            if head_params:
-                optimizer.add_param_group({'params': head_params, 'lr': optimizer.param_groups[0]['lr']})
-                print('Added head parameters to optimizer manually')
+        
+        # Separate head into its own param group with lower LR to prevent bias from becoming too large
+        head_params = [p for p in model.head.parameters() if p.requires_grad]
+        if head_params:
+            # Remove head from existing param groups and add to new one with lower LR
+            base_lr = optimizer.param_groups[0]['lr']
+            head_lr = base_lr * 0.1  # 10x smaller LR for head
+            
+            # Remove head params from existing groups
+            for group in optimizer.param_groups:
+                group['params'] = [p for p in group['params'] 
+                                  if id(p) != id(model.head.weight) and id(p) != id(model.head.bias)]
+            
+            # Add head as separate param group with lower LR
+            optimizer.add_param_group({
+                'params': head_params, 
+                'lr': head_lr,
+                'weight_decay': optimizer.param_groups[0].get('weight_decay', 0.0)
+            })
+            print(f'Head parameters in separate param group with LR={head_lr:.6f} (10x smaller than base LR={base_lr:.6f})')
 
     if args.sched != 'constant':
         lr_scheduler, _ = create_scheduler(args, optimizer)
