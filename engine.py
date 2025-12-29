@@ -383,6 +383,16 @@ class Engine():
                 # compute output            
                 output = model(input)
                 
+                # Debug: Check output statistics before processing
+                if batch_idx == 0 and task_id == 0:
+                    print(f"\n[DEBUG] Raw model output stats:")
+                    print(f"  Output shape: {output.shape}")
+                    print(f"  Output min/max/mean: {output.min().item():.4f} / {output.max().item():.4f} / {output.mean().item():.4f}")
+                    print(f"  Output per-class mean: {output.mean(dim=0)[:min(5, output.shape[1])]}")
+                    if hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear):
+                        print(f"  Head weight stats: min={model.head.weight.min().item():.4f}, max={model.head.weight.max().item():.4f}, mean={model.head.weight.mean().item():.4f}")
+                        print(f"  Head bias: {model.head.bias[:min(5, len(model.head.bias))]}")
+                
                 output, correct, total = self.get_max_label_logits(output, class_mask[task_id],task_id=task_id, target=target,slice=True) 
                 output_ema = [output.softmax(dim=1)]
                 correct_sum+=correct
@@ -413,6 +423,16 @@ class Engine():
                 
                 # Get predictions for confusion matrix (now restricted to seen classes)
                 _, pred = torch.max(output, 1)
+                
+                # Debug: Check prediction distribution
+                if batch_idx == 0 and task_id == 0:
+                    print(f"\n[DEBUG] After masking and processing:")
+                    print(f"  Output shape: {output.shape}")
+                    print(f"  Output min/max/mean: {output.min().item():.4f} / {output.max().item():.4f} / {output.mean().item():.4f}")
+                    print(f"  Output per-class mean: {output.mean(dim=0)}")
+                    print(f"  Predictions in batch: {torch.bincount(pred, minlength=output.shape[1])[:min(5, output.shape[1])]}")
+                    print(f"  Targets in batch: {torch.bincount(target, minlength=output.shape[1])[:min(5, output.shape[1])]}")
+                
                 all_predictions.extend(pred.cpu().numpy())
                 all_targets.extend(target.cpu().numpy())
                 
