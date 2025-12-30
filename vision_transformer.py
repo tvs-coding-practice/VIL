@@ -130,6 +130,74 @@ class Scaler(nn.Module):
     def forward(self, input):
         return input * self.scale
 
+class CosineLinear(nn.Module):
+    """
+    Cosine Linear Layer for classification.
+    Instead of y = Wx + b, computes cosine similarity: y = scale * (W · x) / (||W|| * ||x||)
+    
+    This helps in incremental learning by removing magnitude bias - only the angle/direction
+    between features and weight vectors matters, not their magnitudes. This prevents new
+    classes from dominating predictions simply due to larger weight magnitudes.
+    
+    Args:
+        in_features: Size of each input sample
+        out_features: Size of each output sample (number of classes)
+        scale: Temperature scaling factor (default: 30.0, common in cosine classifiers)
+        bias: If False, no bias term (default: False, as cosine similarity doesn't need bias)
+    """
+    def __init__(self, in_features: int, out_features: int, scale: float = 30.0, bias: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.scale = scale
+        
+        # Weight matrix (no bias for cosine similarity)
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        """Initialize weights using normal distribution."""
+        nn.init.normal_(self.weight, std=0.01)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass: computes cosine similarity between input and weight vectors.
+        
+        Args:
+            x: Input tensor of shape (batch_size, in_features)
+            
+        Returns:
+            Output tensor of shape (batch_size, out_features)
+        """
+        # Normalize input features (L2 normalization)
+        x_norm = F.normalize(x, p=2, dim=1, eps=1e-8)
+        
+        # Normalize weight vectors (L2 normalization)
+        weight_norm = F.normalize(self.weight, p=2, dim=1, eps=1e-8)
+        
+        # Compute cosine similarity: (x_norm @ weight_norm^T)
+        # This gives cos(θ) between each input and each weight vector
+        output = F.linear(x_norm, weight_norm, None)
+        
+        # Scale by temperature factor (common in cosine classifiers)
+        output = output * self.scale
+        
+        # Add bias if present (though typically not used in cosine classifiers)
+        if self.bias is not None:
+            output = output + self.bias
+        
+        return output
+    
+    def extra_repr(self) -> str:
+        return f'in_features={self.in_features}, out_features={self.out_features}, scale={self.scale}, bias={self.bias is not None}'
+
 class LoRALinear(nn.Module):
     """
     LoRA (Low-Rank Adaptation) wrapper for Linear layers.
@@ -451,10 +519,10 @@ class VisionTransformer(nn.Module):
 
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
-        # Classifier Head
+        # Classifier Head - Using Cosine Linear for better incremental learning
         self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
         self.head_drop = nn.Dropout(drop_rate)
-        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        self.head = CosineLinear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         # Projection Head for Supervised Contrastive Learning (SupCon)
         # Default projection_dim=128, can be overridden via args
@@ -613,7 +681,7 @@ class VisionTransformer(nn.Module):
         if global_pool is not None:
             assert global_pool in ('', 'avg', 'token')
             self.global_pool = global_pool
-        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        self.head = CosineLinear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def _pos_embed(self, x):
         if self.no_embed_class:
@@ -874,19 +942,39 @@ def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = 
     model.norm.weight.copy_(_n2p(w[f'{prefix}Transformer/encoder_norm/scale']))
     model.norm.bias.copy_(_n2p(w[f'{prefix}Transformer/encoder_norm/bias']))
     # Load head weights only if dimensions match, otherwise re-initialize properly
-    if isinstance(model.head, nn.Linear):
+    if isinstance(model.head, (nn.Linear, CosineLinear)):
         pretrained_head_bias = w.get(f'{prefix}head/bias', None)
-        if pretrained_head_bias is not None and model.head.bias.shape[0] == pretrained_head_bias.shape[-1]:
-            model.head.weight.copy_(_n2p(w[f'{prefix}head/kernel']))
-            model.head.bias.copy_(_n2p(w[f'{prefix}head/bias']))
-        else:
-            # Head size doesn't match pretrained, re-initialize with proper initialization
-            if pretrained_head_bias is not None:
-                _logger.info(f"Head size mismatch: model has {model.head.bias.shape[0]} classes, "
-                           f"pretrained has {pretrained_head_bias.shape[-1]}. Re-initializing head.")
-            # Re-initialize head with proper initialization (truncated normal, not zeros)
-            trunc_normal_(model.head.weight, std=.02)
-            nn.init.zeros_(model.head.bias)
+        # For CosineLinear, we can load weights but they'll be normalized during forward pass
+        if isinstance(model.head, nn.Linear):
+            if pretrained_head_bias is not None and model.head.bias.shape[0] == pretrained_head_bias.shape[-1]:
+                model.head.weight.copy_(_n2p(w[f'{prefix}head/kernel']))
+                model.head.bias.copy_(_n2p(w[f'{prefix}head/bias']))
+            else:
+                # Head size doesn't match pretrained, re-initialize with proper initialization
+                if pretrained_head_bias is not None:
+                    _logger.info(f"Head size mismatch: model has {model.head.bias.shape[0]} classes, "
+                               f"pretrained has {pretrained_head_bias.shape[-1]}. Re-initializing head.")
+                # Re-initialize head with proper initialization (truncated normal, not zeros)
+                trunc_normal_(model.head.weight, std=.02)
+                nn.init.zeros_(model.head.bias)
+        elif isinstance(model.head, CosineLinear):
+            # For CosineLinear, load weights if dimensions match
+            pretrained_head_weight = w.get(f'{prefix}head/kernel', None)
+            if pretrained_head_weight is not None:
+                pretrained_weight = _n2p(w[f'{prefix}head/kernel'])
+                if model.head.weight.shape == pretrained_weight.shape:
+                    model.head.weight.copy_(pretrained_weight)
+                    _logger.info("Loaded pretrained weights into CosineLinear head (will be normalized during forward pass).")
+                else:
+                    _logger.info(f"CosineLinear head size mismatch: model has {model.head.weight.shape}, "
+                               f"pretrained has {pretrained_weight.shape}. Re-initializing head.")
+                    # CosineLinear already initialized in __init__, no need to re-init
+                # CosineLinear typically doesn't use bias, but handle it if present
+                if model.head.bias is not None and pretrained_head_bias is not None:
+                    if model.head.bias.shape[0] == pretrained_head_bias.shape[-1]:
+                        model.head.bias.copy_(_n2p(w[f'{prefix}head/bias']))
+            else:
+                _logger.info("No pretrained head weights found. CosineLinear head will use random initialization.")
     # NOTE representation layer has been removed, not used in latest 21k/1k pretrained weights
     # if isinstance(getattr(model.pre_logits, 'fc', None), nn.Linear) and f'{prefix}pre_logits/bias' in w:
     #     model.pre_logits.fc.weight.copy_(_n2p(w[f'{prefix}pre_logits/kernel']))
