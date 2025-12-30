@@ -169,7 +169,12 @@ class LoRALinear(nn.Module):
         result = self.linear(x)
         
         # LoRA adaptation: x @ A^T @ B^T * scaling
-        lora_output = self.lora_dropout(x) @ self.lora_A.T @ self.lora_B.T * self.scaling
+        # Optimized to reduce memory: compute in steps
+        x_drop = self.lora_dropout(x)
+        # Compute x @ A^T more efficiently
+        lora_A_output = torch.matmul(x_drop, self.lora_A.T)
+        # Compute (x @ A^T) @ B^T * scaling
+        lora_output = torch.matmul(lora_A_output, self.lora_B.T) * self.scaling
         result = result + lora_output
         
         return result

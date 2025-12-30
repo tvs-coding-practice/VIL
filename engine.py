@@ -8,6 +8,7 @@ from typing import Iterable
 from pathlib import Path
 
 import torch
+import gc  # For garbage collection
 
 import numpy as np
 
@@ -288,13 +289,6 @@ class Engine():
 
             loss = criterion(logits, target) # (bs, class), (bs)
             
-            # Add head bias regularization to prevent biased predictions
-            # This penalizes large head bias values to ensure the model relies on features, not bias
-            if hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear) and model.head.bias is not None:
-                # L2 regularization on head bias - encourage it to stay near zero
-                head_bias_reg = 0.001 * torch.sum(model.head.bias ** 2)
-                loss = loss + head_bias_reg
-            
             if self.args.use_cast_loss:
                 if len(self.adapter_vec)> args.k: 
                     cur_adapters = model.get_adapter()
@@ -331,16 +325,42 @@ class Engine():
 
             optimizer.zero_grad()
             
-            loss.backward(retain_graph=True) 
+            # Store loss value before backward pass (needed for logging)
+            loss_value = loss.item()
+            
+            # Use retain_graph=False to free computation graph immediately
+            # This is a MAJOR memory saver - retain_graph=True was keeping the entire graph in memory!
+            loss.backward(retain_graph=False) 
             optimizer.step()
+            
+            # Explicitly delete intermediate tensors to free memory
+            del loss
+            if 'output' in locals():
+                del output
+            if 'logits' in locals():
+                del logits
+            if 'distill_loss' in locals() and distill_loss != 0:
+                del distill_loss
+            if 'orth_loss' in locals():
+                del orth_loss
+            
             torch.cuda.synchronize()
-            metric_logger.update(Loss=loss.item())
+            
+            # Periodically clear cache to prevent memory fragmentation
+            if batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()  # Force Python garbage collection
+            
+            metric_logger.update(Loss=loss_value)
             metric_logger.update(Lr=optimizer.param_groups[0]["lr"])
             metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
             metric_logger.meters['Acc@3'].update(acc3.item(), n=input.shape[0])
 
             if ema_model is not None:
                 ema_model.update(model.get_adapter())
+            
+            # Delete input and target after use to free memory
+            del input, target
             
         # gather the stats from all processes
         metric_logger.synchronize_between_processes()

@@ -73,6 +73,11 @@ def main(args):
     )
 
     model.to(device)
+    
+    # Enable gradient checkpointing to save memory (trades compute for memory)
+    if hasattr(model, 'set_grad_checkpointing'):
+        model.set_grad_checkpointing(True)
+        print("Gradient checkpointing enabled to save memory")
 
     # Initialize Engine
     engine = Engine(model=model, device=device, class_mask=class_mask, domain_list=domain_list, args=args)
@@ -113,8 +118,14 @@ def main(args):
                 p.requires_grad = True
                 trainable_params.append(n)
             elif 'head' in n: # Always train the classifier head
-                p.requires_grad = True
-                trainable_params.append(n)
+                if 'bias' in n:
+                    # Freeze head bias to prevent it from learning class bias
+                    # The model should learn from features, not bias
+                    p.requires_grad = False
+                    print(f"Freezing head bias: {n}")
+                else:
+                    p.requires_grad = True
+                    trainable_params.append(n)
             elif 'norm' in n: # <--- CRITICAL FIX: Train LayerNorms
                 p.requires_grad = True
                 trainable_params.append(n)
@@ -158,7 +169,8 @@ def main(args):
                 break
         print(f'Head parameters in optimizer: {head_in_optimizer}')
         
-        # Separate head into its own param group with lower LR to prevent bias from becoming too large
+        # Separate head weights (not bias) into its own param group with lower LR
+        # Head bias is frozen, so we only need to handle weights
         head_params = [p for p in model.head.parameters() if p.requires_grad]
         if head_params:
             # Remove head from existing param groups and add to new one with lower LR
