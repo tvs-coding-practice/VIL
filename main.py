@@ -78,6 +78,15 @@ def main(args):
     if hasattr(model, 'set_grad_checkpointing'):
         model.set_grad_checkpointing(True)
         print("Gradient checkpointing enabled to save memory")
+    
+    # Initialize projection head for SupCon if enabled
+    if args.use_supcon:
+        if hasattr(model, 'init_projection_head'):
+            model.init_projection_head(projection_dim=args.projection_dim)
+            print(f"Initialized SupCon projection head with dimension {args.projection_dim}")
+        else:
+            print("Warning: Model does not support projection head. SupCon will be disabled.")
+            args.use_supcon = False
 
     # Initialize Engine
     engine = Engine(model=model, device=device, class_mask=class_mask, domain_list=domain_list, args=args)
@@ -126,6 +135,9 @@ def main(args):
                 else:
                     p.requires_grad = True
                     trainable_params.append(n)
+            elif 'projection_head' in n: # Train projection head for SupCon
+                p.requires_grad = True
+                trainable_params.append(n)
             elif 'norm' in n: # <--- CRITICAL FIX: Train LayerNorms
                 p.requires_grad = True
                 trainable_params.append(n)
@@ -334,6 +346,12 @@ if __name__ == '__main__':
     parser.add_argument('--k', default=2, type=int, help='the number of clusters in shift pool')
     parser.add_argument('--use_cast_loss', action='store_true', default=False, help='if using CAST loss')
     parser.add_argument('--norm_cast', action='store_true', default=False, help='if using normalization in cast')
+    
+    #! SupCon (Supervised Contrastive Loss)
+    parser.add_argument('--use_supcon', action='store_true', default=False, help='if using Supervised Contrastive Loss')
+    parser.add_argument('--supcon_weight', default=0.5, type=float, help='coefficient of SupCon loss (default: 0.5)')
+    parser.add_argument('--supcon_temperature', default=0.07, type=float, help='temperature parameter for SupCon (default: 0.07)')
+    parser.add_argument('--projection_dim', default=128, type=int, help='dimension of projection head for SupCon (default: 128)')
     
     # -------------------------------------------------------------------------
     # LoRA PARAMETERS (LoRA is now the default method)

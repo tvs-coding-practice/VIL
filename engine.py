@@ -21,6 +21,55 @@ from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
 from sklearn.metrics import confusion_matrix
 import matplotlib.pyplot as plt
+from torchvision import transforms
+
+
+def supervised_contrastive_loss(features, labels, temperature=0.07):
+    """
+    Supervised Contrastive Loss as described in:
+    "Supervised Contrastive Learning" by Khosla et al., NeurIPS 2020
+    
+    Args:
+        features: Tensor of shape [2*N, projection_dim] where N is batch size
+                 Features from two augmentations of the same batch
+        labels: Tensor of shape [2*N] with class labels
+        temperature: Temperature parameter for scaling (default: 0.07)
+    
+    Returns:
+        Loss value (scalar tensor)
+    """
+    device = features.device
+    batch_size = features.shape[0]
+    
+    # Normalize features (should already be normalized, but ensure it)
+    features = F.normalize(features, p=2, dim=1)
+    
+    # Create mask for positive pairs (same class)
+    labels = labels.contiguous().view(-1, 1)
+    mask = torch.eq(labels, labels.T).float().to(device)
+    
+    # Compute similarity matrix
+    similarity_matrix = torch.matmul(features, features.T) / temperature
+    
+    # For numerical stability, subtract max
+    logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
+    logits = similarity_matrix - logits_max.detach()
+    
+    # Create mask to exclude self-contrast (diagonal)
+    logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=device)
+    mask = mask * logits_mask
+    
+    # Compute exp logits
+    exp_logits = torch.exp(logits) * logits_mask
+    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
+    
+    # Compute mean of log-likelihood over positive pairs
+    mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-8)
+    
+    # Loss is the negative log-likelihood
+    loss = -mean_log_prob_pos.mean()
+    
+    return loss
 
 
 class ManualEMA:
@@ -258,6 +307,52 @@ class Engine():
                     break
             input = input.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
+            
+            # For SupCon: Create two augmentations of the same batch
+            supcon_loss = 0
+            if args.use_supcon and model.use_supcon:
+                # Create two views by applying different augmentations
+                # View 1: original input (already augmented by dataset)
+                input_aug1 = input.clone()
+                
+                # View 2: apply additional random augmentations
+                # Use random erasing, color jitter, and Gaussian noise for diversity
+                input_aug2 = input.clone()
+                batch_size = input_aug2.shape[0]
+                
+                # Apply random augmentations to create second view
+                for i in range(batch_size):
+                    img = input_aug2[i]
+                    
+                    # Random erasing (20% chance per image)
+                    if torch.rand(1).item() < 0.2:
+                        _, h, w = img.shape
+                        erase_area = h * w * 0.02  # 2% of image
+                        erase_h = max(1, int(torch.sqrt(erase_area * (torch.rand(1).item() * 0.3 + 0.1))))
+                        erase_w = max(1, int(erase_area / erase_h))
+                        erase_y = torch.randint(0, max(1, h - erase_h + 1), (1,)).item()
+                        erase_x = torch.randint(0, max(1, w - erase_w + 1), (1,)).item()
+                        # Fill with random values
+                        img[:, erase_y:erase_y+erase_h, erase_x:erase_x+erase_w] = torch.randn_like(
+                            img[:, erase_y:erase_y+erase_h, erase_x:erase_x+erase_w]) * 0.1
+                    
+                    # Add small Gaussian noise (30% chance)
+                    if torch.rand(1).item() < 0.3:
+                        img.add_(torch.randn_like(img) * 0.02)
+                        img.clamp_(0, 1)
+                
+                # Concatenate both views: [view1, view2]
+                input_concat = torch.cat([input_aug1, input_aug2], dim=0)
+                target_concat = torch.cat([target, target], dim=0)
+                
+                # Get features and project
+                features = model.forward_features(input_concat)
+                projected = model.forward_projection(features)
+                
+                # Compute SupCon loss
+                supcon_loss = supervised_contrastive_loss(projected, target_concat, temperature=args.supcon_temperature)
+                supcon_loss = args.supcon_weight * supcon_loss
+            
             output = model(input) # (bs, class + n)
             distill_loss=0
             if self.distill_head != None:
@@ -288,6 +383,10 @@ class Engine():
                 logits = output.index_fill(dim=1, index=not_mask, value=float('-inf'))
 
             loss = criterion(logits, target) # (bs, class), (bs)
+            
+            # Add SupCon loss
+            if args.use_supcon and model.use_supcon and supcon_loss > 0:
+                loss += supcon_loss
             
             if self.args.use_cast_loss:
                 if len(self.adapter_vec)> args.k: 
@@ -343,6 +442,8 @@ class Engine():
                 del distill_loss
             if 'orth_loss' in locals():
                 del orth_loss
+            if 'supcon_loss' in locals() and supcon_loss != 0:
+                del supcon_loss
             
             torch.cuda.synchronize()
             

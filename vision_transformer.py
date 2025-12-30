@@ -456,8 +456,60 @@ class VisionTransformer(nn.Module):
         self.head_drop = nn.Dropout(drop_rate)
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
+        # Projection Head for Supervised Contrastive Learning (SupCon)
+        # Default projection_dim=128, can be overridden via args
+        self.use_supcon = False  # Will be set externally
+        self.projection_dim = 128  # Default, can be overridden
+        self.projection_head = None  # Will be initialized if SupCon is enabled
+
         if weight_init != 'skip':
             self.init_weights(weight_init)
+    
+    def init_projection_head(self, projection_dim=128):
+        """Initialize the projection head for SupCon.
+        
+        Args:
+            projection_dim: Dimension of the projected embeddings (default: 128)
+        """
+        self.use_supcon = True
+        self.projection_dim = projection_dim
+        # Two-layer MLP: embed_dim -> hidden_dim -> projection_dim
+        hidden_dim = self.embed_dim
+        self.projection_head = nn.Sequential(
+            nn.Linear(self.embed_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, projection_dim)
+        )
+        # Initialize projection head weights
+        for m in self.projection_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def forward_projection(self, x):
+        """Forward pass through projection head for SupCon.
+        
+        Args:
+            x: Features from forward_features (before classifier head)
+            
+        Returns:
+            Projected embeddings normalized to unit sphere
+        """
+        if not self.use_supcon or self.projection_head is None:
+            raise RuntimeError("Projection head not initialized. Call init_projection_head() first.")
+        
+        # Extract CLS token or average pool
+        if self.global_pool:
+            x = x[:, self.num_prefix_tokens:].mean(dim=1) if self.global_pool == 'avg' else x[:, 0]
+        else:
+            x = x[:, 0]  # Use CLS token
+        
+        x = self.fc_norm(x)
+        x = self.projection_head(x)
+        # L2 normalize for contrastive learning
+        x = F.normalize(x, p=2, dim=1)
+        return x
     
     def get_adapter(self):
         """
