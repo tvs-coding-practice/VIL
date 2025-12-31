@@ -327,8 +327,9 @@ class Engine():
                     # Random erasing (20% chance per image)
                     if torch.rand(1).item() < 0.2:
                         _, h, w = img.shape
-                        erase_area = h * w * 0.02  # 2% of image
-                        erase_h = max(1, int(torch.sqrt(erase_area * (torch.rand(1).item() * 0.3 + 0.1))))
+                        erase_area = float(h * w * 0.02)  # 2% of image
+                        # Use math.sqrt for Python floats, not torch.sqrt
+                        erase_h = max(1, int(math.sqrt(erase_area * (torch.rand(1).item() * 0.3 + 0.1))))
                         erase_w = max(1, int(erase_area / erase_h))
                         erase_y = torch.randint(0, max(1, h - erase_h + 1), (1,)).item()
                         erase_x = torch.randint(0, max(1, w - erase_w + 1), (1,)).item()
