@@ -74,19 +74,22 @@ def main(args):
 
     model.to(device)
     
+    # Initialize projection head for SupCon if enabled (AFTER moving model to device)
+    if args.use_supcon:
+        if hasattr(model, 'init_projection_head'):
+            model.init_projection_head(projection_dim=args.projection_dim)
+            # Ensure projection head is on the same device as the model
+            if model.projection_head is not None:
+                model.projection_head.to(device)
+            print(f"Initialized SupCon projection head with dimension {args.projection_dim} on device {device}")
+        else:
+            print("Warning: Model does not support projection head. SupCon will be disabled.")
+            args.use_supcon = False
+    
     # Enable gradient checkpointing to save memory (trades compute for memory)
     if hasattr(model, 'set_grad_checkpointing'):
         model.set_grad_checkpointing(True)
         print("Gradient checkpointing enabled to save memory")
-    
-    # Initialize projection head for SupCon if enabled
-    if args.use_supcon:
-        if hasattr(model, 'init_projection_head'):
-            model.init_projection_head(projection_dim=args.projection_dim)
-            print(f"Initialized SupCon projection head with dimension {args.projection_dim}")
-        else:
-            print("Warning: Model does not support projection head. SupCon will be disabled.")
-            args.use_supcon = False
 
     # Initialize Engine
     engine = Engine(model=model, device=device, class_mask=class_mask, domain_list=domain_list, args=args)

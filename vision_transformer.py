@@ -554,6 +554,12 @@ class VisionTransformer(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        
+        # Move projection head to the same device as the model
+        # Get device from an existing parameter
+        if hasattr(self, 'head') and isinstance(self.head, nn.Linear):
+            device = next(self.head.parameters()).device
+            self.projection_head.to(device)
     
     def forward_projection(self, x):
         """Forward pass through projection head for SupCon.
