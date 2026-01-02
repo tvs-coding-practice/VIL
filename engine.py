@@ -289,7 +289,7 @@ class Engine():
         weights = weights / torch.sum(weights) # summation-> 1
         return weights
     
-def train_one_epoch(self, model: torch.nn.Module, 
+    def train_one_epoch(self, model: torch.nn.Module, 
                         criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer,
                         device: torch.device, epoch: int, max_norm: float = 0,
                         set_training_mode=True, task_id=-1, class_mask=None, ema_model = None, args = None):
