@@ -458,7 +458,6 @@ def build_vil_scenario(splited_dataset, args):
 
 
 def build_transform(is_train, args):
-    # Base transform (Standard)
     if is_train:
         transform = transforms.Compose([
             transforms.Resize(256),
@@ -478,16 +477,19 @@ def build_transform(is_train, args):
 
     # If using SupCon, we need to return two views
     if is_train and args.use_supcon:
-        # Define the 'Strong' augmentation you were doing manually in engine.py
-        # Note: Gaussian noise is usually done on tensors, but standard transforms are cleaner.
         strong_transform = transforms.Compose([
+            # 1. PIL Image Transforms
             transforms.Resize(256),
             transforms.RandomCrop(224),
             transforms.RandomRotation(degrees=10),
-            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1), # Stronger jitter
-            transforms.RandomErasing(p=0.2, scale=(0.02, 0.33)), # Replaces your manual erasing
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+            
+            # 2. Convert to Tensor
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            
+            # 3. Tensor Transforms (MUST come after ToTensor)
+            transforms.RandomErasing(p=0.2, scale=(0.02, 0.33)), 
         ])
         
         return TwoCropTransform(transform, strong_transform)
