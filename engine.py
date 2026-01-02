@@ -289,186 +289,160 @@ class Engine():
         weights = weights / torch.sum(weights) # summation-> 1
         return weights
     
-    def train_one_epoch(self,model: torch.nn.Module, 
+def train_one_epoch(self, model: torch.nn.Module, 
                         criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer,
                         device: torch.device, epoch: int, max_norm: float = 0,
-                        set_training_mode=True, task_id=-1, class_mask=None, ema_model = None, args = None,):
+                        set_training_mode=True, task_id=-1, class_mask=None, ema_model = None, args = None):
 
         model.train(set_training_mode)
 
         metric_logger = utils.MetricLogger(delimiter="  ")
         metric_logger.add_meter('Lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
         metric_logger.add_meter('Loss', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-        header = f'Train: Epoch[{epoch+1:{int(math.log10(args.epochs))+1}}/{args.epochs}]'
         
-        for batch_idx, (input, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
-            if self.args.develop:
-                if batch_idx>20:
-                    break
-            input = input.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-            
-            # For SupCon: Create two augmentations of the same batch
-            supcon_loss = 0
-            if args.use_supcon and model.use_supcon:
-                # Create two views by applying different augmentations
-                # View 1: original input (already augmented by dataset)
-                input_aug1 = input.clone()
-                
-                # View 2: apply additional random augmentations
-                # Use random erasing, color jitter, and Gaussian noise for diversity
-                input_aug2 = input.clone()
-                batch_size = input_aug2.shape[0]
-                
-                # Apply random augmentations to create second view
-                for i in range(batch_size):
-                    img = input_aug2[i]
-                    
-                    # Random erasing (20% chance per image)
-                    if torch.rand(1).item() < 0.2:
-                        _, h, w = img.shape
-                        erase_area = float(h * w * 0.02)  # 2% of image
-                        # Use math.sqrt for Python floats, not torch.sqrt
-                        erase_h = max(1, int(math.sqrt(erase_area * (torch.rand(1).item() * 0.3 + 0.1))))
-                        erase_w = max(1, int(erase_area / erase_h))
-                        erase_y = torch.randint(0, max(1, h - erase_h + 1), (1,)).item()
-                        erase_x = torch.randint(0, max(1, w - erase_w + 1), (1,)).item()
-                        # Fill with random values
-                        img[:, erase_y:erase_y+erase_h, erase_x:erase_x+erase_w] = torch.randn_like(
-                            img[:, erase_y:erase_y+erase_h, erase_x:erase_x+erase_w]) * 0.1
-                    
-                    # Add small Gaussian noise (30% chance)
-                    if torch.rand(1).item() < 0.3:
-                        img.add_(torch.randn_like(img) * 0.02)
-                        img.clamp_(0, 1)
-                
-                # Concatenate both views: [view1, view2]
-                input_concat = torch.cat([input_aug1, input_aug2], dim=0)
-                target_concat = torch.cat([target, target], dim=0)
-                
-                # Get features and project
-                features = model.forward_features(input_concat)
-                projected = model.forward_projection(features)
-                
-                # Compute SupCon loss
-                supcon_loss = supervised_contrastive_loss(projected, target_concat, temperature=args.supcon_temperature)
-                supcon_loss = args.supcon_weight * supcon_loss
-            
-            output = model(input) # (bs, class + n)
-            distill_loss=0
-            if self.distill_head != None:
-                feature = model.forward_features(input)[:,0]
-                output_distill = self.distill_head(feature) 
-                #! exclude added nodes in current task during distillation
-                mask = torch.isin(torch.tensor(self.labels_in_head), torch.tensor(self.current_classes))
-                cur_class_nodes = torch.where(mask)[0]#[:-len(self.added_classes_in_cur_task)] #! to be fixed
-                m=torch.isin(torch.tensor(self.labels_in_head[cur_class_nodes]), torch.tensor(list(self.added_classes_in_cur_task)))
-                distill_node_indices = self.labels_in_head[cur_class_nodes][~m]
-                distill_loss = self.kl_div(output[:,distill_node_indices], output_distill[:,distill_node_indices])
-               
+        header = 'Epoch: [{}]'.format(epoch)
+        print_freq = 10
         
-            if output.shape[-1] > self.num_classes: # there are already added nodes till now 
-                output,_,_ = self.get_max_label_logits(output, class_mask[task_id],slice=False)
-                if len(self.added_classes_in_cur_task) > 0: # there are added nodes in current task
-                    for added_class in self.added_classes_in_cur_task:
-                        cur_node = np.where(self.labels_in_head == added_class)[0][-1] # the latest appended node
-                        output[:, added_class] = output[:,cur_node]# replace logit value of added label
-                    
-                output = output[:, :self.num_classes]       
-                
-            # here is the trick to mask out classes of non-current tasks
-            if args.train_mask and class_mask is not None:
-                mask = class_mask[task_id]
-                not_mask = np.setdiff1d(np.arange(args.nb_classes), mask)
-                not_mask = torch.tensor(not_mask, dtype=torch.int64).to(device)
-                logits = output.index_fill(dim=1, index=not_mask, value=float('-inf'))
+        # Helper to get underlying model (handles DataParallel wrapping)
+        model_module = self.get_model_module(model)
 
-            loss = criterion(logits, target) # (bs, class), (bs)
+        for batch_idx, (input, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
             
-            # Add SupCon loss
-            if args.use_supcon and model.use_supcon and supcon_loss > 0:
-                loss += supcon_loss
+            # Initialize auxiliary losses
+            distill_loss = 0
+            supcon_loss = 0
             
+            # ------------------------------------------------------------------
+            # 1. OPTIMIZED DATA LOADING & FORWARD PASS
+            # ------------------------------------------------------------------
+            if args.use_supcon and isinstance(input, list):
+                # --- SupCon Path (Parallelized Augmentation) ---
+                # Input is [view1, view2] from TwoCropTransform
+                view1, view2 = input
+                
+                # Move both views to GPU
+                view1 = view1.to(device, non_blocking=True)
+                view2 = view2.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                
+                # Concatenate for single efficient forward pass: Shape [2*B, C, H, W]
+                images = torch.cat([view1, view2], dim=0)
+                
+                # Forward pass
+                output = model(images)
+                
+                # Split output back to [View1, View2] for specific losses
+                bs = view1.shape[0]
+                output1 = output[:bs] # Logits/Features for View 1
+                
+                # Calculate SupCon Loss
+                # We duplicate targets because we have 2 views per image in 'output'
+                supcon_targets = torch.cat([target, target], dim=0)
+                supcon_loss = supervised_contrastive_loss(output, supcon_targets, temperature=args.supcon_temperature)
+                
+                # For Standard CE Loss and Accuracy, we use View 1 (Standard Augmentation)
+                logits = output1
+                
+            else:
+                # --- Standard Path (No SupCon) ---
+                input = input.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                
+                output = model(input)
+                logits = output
+
+            # ------------------------------------------------------------------
+            # 2. CALCULATE LOSSES
+            # ------------------------------------------------------------------
+            
+            # Base Cross Entropy Loss
+            loss = criterion(logits, target)
+
+            # Add SupCon Loss if enabled
+            if args.use_supcon:
+                loss += args.supcon_weight * supcon_loss
+
+            # CAST Loss (Orthogonality for Adapters/LoRA)
             if self.args.use_cast_loss:
-                if len(self.adapter_vec)> args.k: 
-                    cur_adapters = model.get_adapter()
+                if len(self.adapter_vec) > args.k:
+                    # Get current parameters
+                    cur_adapters = model_module.get_adapter() if hasattr(model_module, 'get_adapter') else []
                     self.cur_adapters = self.flatten_parameters(cur_adapters)
-                    diff_adapter = self.cur_adapters-self.prev_adapters
+                    
+                    # Calculate difference from previous task
+                    diff_adapter = self.cur_adapters - self.prev_adapters
+                    
+                    # Find clusters and calculate distance
                     _, other = self.find_same_cluster_items(diff_adapter)
                     sim = 0
                     
-                    # if self.args.ws:
-                    weights = self.calculate_l2_distance(diff_adapter,other)
-                    for o,w in zip(other,weights):
+                    weights = self.calculate_l2_distance(diff_adapter, other)
+                    for o, w in zip(other, weights):
                         if self.args.norm_cast:
-                            sim += w * torch.matmul(diff_adapter, o) / (torch.norm(diff_adapter)*torch.norm(o))
+                            sim += w * torch.matmul(diff_adapter, o) / (torch.norm(diff_adapter) * torch.norm(o))
                         else:
                             sim += w * torch.matmul(diff_adapter, o)
-                    # else:
-                        # for o in other:
-                            # sim += torch.matmul(diff_adapter, o)
-                        # sim /= len(other)
+                            
                     orth_loss = args.beta * torch.abs(sim)
-                    if self.args.use_cast_loss:  
-                        if orth_loss>0:
-                            loss += orth_loss
-                    
-            if self.args.IC:
+                    if orth_loss > 0:
+                        loss += orth_loss
+
+            # Distillation Loss (IC)
+            if self.args.IC and ema_model is not None:
+                with torch.no_grad():
+                    # Get teacher output for the standard view
+                    # Handle list input case for teacher if needed
+                    teacher_input = input[0] if isinstance(input, list) else input
+                    teacher_input = teacher_input.to(device, non_blocking=True)
+                    teacher_output = ema_model.module(teacher_input)
+                
+                # Calculate KL Divergence
+                distill_loss = self.kl_div(logits, teacher_output)
                 if distill_loss > 0:
                     loss += distill_loss
-           
-            acc1, acc3 = accuracy(logits, target, topk=(1, 3))
 
+            # ------------------------------------------------------------------
+            # 3. OPTIMIZATION STEP
+            # ------------------------------------------------------------------
+            acc1, acc5 = accuracy(logits, target, topk=(1, 5)) if logits.shape[1] >= 5 else accuracy(logits, target, topk=(1, 1))
+            
             if not math.isfinite(loss.item()):
                 print("Loss is {}, stopping training".format(loss.item()))
                 sys.exit(1)
 
             optimizer.zero_grad()
+            loss.backward()
             
-            # Store loss value before backward pass (needed for logging)
-            loss_value = loss.item()
-            
-            # Use retain_graph=False to free computation graph immediately
-            # This is a MAJOR memory saver - retain_graph=True was keeping the entire graph in memory!
-            loss.backward(retain_graph=False) 
+            if max_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+                
             optimizer.step()
-            
-            # Explicitly delete intermediate tensors to free memory
-            del loss
-            if 'output' in locals():
-                del output
-            if 'logits' in locals():
-                del logits
-            if 'distill_loss' in locals() and distill_loss != 0:
-                del distill_loss
-            if 'orth_loss' in locals():
-                del orth_loss
-            if 'supcon_loss' in locals() and supcon_loss != 0:
-                del supcon_loss
-            
+
+            # Update EMA model
+            if ema_model is not None:
+                ema_model.update(model)
+
             torch.cuda.synchronize()
             
-            # Periodically clear cache to prevent memory fragmentation
-            if batch_idx % 10 == 0:
-                torch.cuda.empty_cache()
-                gc.collect()  # Force Python garbage collection
-            
-            metric_logger.update(Loss=loss_value)
+            metric_logger.update(Loss=loss.item())
             metric_logger.update(Lr=optimizer.param_groups[0]["lr"])
-            metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
-            metric_logger.meters['Acc@3'].update(acc3.item(), n=input.shape[0])
 
-            if ema_model is not None:
-                ema_model.update(model.get_adapter())
+            # --- MEMORY OPTIMIZATION START ---
+            # 1. Zero gradients with set_to_none=True (Saves memory compared to setting to 0)
+            optimizer.zero_grad(set_to_none=True)
+
+            # 2. Explicitly delete large tensors to free computation graph immediately
+            del input, target, loss, logits, output
             
-            # Delete input and target after use to free memory
-            del input, target
+            # Delete SupCon specific variables if they exist
+            if 'images' in locals(): del images
+            if 'view1' in locals(): del view1
+            if 'view2' in locals(): del view2
+            if 'supcon_loss' in locals(): del supcon_loss
+            # --- MEMORY OPTIMIZATION END ---
             
-        # gather the stats from all processes
-        metric_logger.synchronize_between_processes()
-        print("Averaged stats:", metric_logger)
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
+                            
     def get_max_label_logits(self,output, class_mask,task_id=None, slice=True,target=None):
         #! Get max value for each label output
         correct=0
