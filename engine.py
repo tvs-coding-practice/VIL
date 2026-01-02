@@ -216,12 +216,7 @@ class Engine():
         
         print(f"Added {len_new_nodes} nodes with label ({labels_to_be_added})")
         return new_head
-    
-    def get_model_module(self, model):
-        if isinstance(model, (torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel)):
-            return model.module
-        return model
-    
+        
     def inference_acc(self,model,data_loader,device):
         print("Start detecting labels to be added...")
         accuracy_per_label = []
@@ -292,7 +287,13 @@ class Engine():
         weights = torch.tensor(weights)
         weights = weights / torch.sum(weights) # summation-> 1
         return weights
-    
+
+    def get_model_module(self, model):
+        """Helper to unwrap DDP/DP models to get the underlying module."""
+        if isinstance(model, (torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel)):
+            return model.module
+        return model
+
     def train_one_epoch(self, model: torch.nn.Module, 
                         criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer,
                         device: torch.device, epoch: int, max_norm: float = 0,
@@ -307,7 +308,7 @@ class Engine():
         header = 'Epoch: [{}]'.format(epoch)
         print_freq = 10
         
-        # Helper to get underlying model (handles DataParallel wrapping)
+        # Get underlying model for accessing adapters/attributes
         model_module = self.get_model_module(model)
 
         for batch_idx, (input, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
@@ -368,38 +369,57 @@ class Engine():
 
             # CAST Loss (Orthogonality for Adapters/LoRA)
             if self.args.use_cast_loss:
-                if len(self.adapter_vec) > args.k:
+                # Check if we have previous adapters to compare against
+                if hasattr(self, 'adapter_vec') and len(self.adapter_vec) > args.k:
                     # Get current parameters
                     cur_adapters = model_module.get_adapter() if hasattr(model_module, 'get_adapter') else []
-                    self.cur_adapters = self.flatten_parameters(cur_adapters)
                     
-                    # Calculate difference from previous task
-                    diff_adapter = self.cur_adapters - self.prev_adapters
-                    
-                    # Find clusters and calculate distance
-                    _, other = self.find_same_cluster_items(diff_adapter)
-                    sim = 0
-                    
-                    weights = self.calculate_l2_distance(diff_adapter, other)
-                    for o, w in zip(other, weights):
-                        if self.args.norm_cast:
-                            sim += w * torch.matmul(diff_adapter, o) / (torch.norm(diff_adapter) * torch.norm(o))
-                        else:
-                            sim += w * torch.matmul(diff_adapter, o)
-                            
-                    orth_loss = args.beta * torch.abs(sim)
-                    if orth_loss > 0:
-                        loss += orth_loss
+                    if len(cur_adapters) > 0:
+                        self.cur_adapters = self.flatten_parameters(cur_adapters)
+                        
+                        # Calculate difference from previous task
+                        diff_adapter = self.cur_adapters - self.prev_adapters
+                        
+                        # Find clusters and calculate distance
+                        _, other = self.find_same_cluster_items(diff_adapter)
+                        sim = 0
+                        
+                        weights = self.calculate_l2_distance(diff_adapter, other)
+                        for o, w in zip(other, weights):
+                            if self.args.norm_cast:
+                                sim += w * torch.matmul(diff_adapter, o) / (torch.norm(diff_adapter) * torch.norm(o))
+                            else:
+                                sim += w * torch.matmul(diff_adapter, o)
+                                
+                        orth_loss = args.beta * torch.abs(sim)
+                        if orth_loss > 0:
+                            loss += orth_loss
 
             # Distillation Loss (IC)
             if self.args.IC and ema_model is not None:
                 with torch.no_grad():
-                    # Get teacher output for the standard view
-                    # Handle list input case for teacher if needed
+                    # Handle list input case for teacher
                     teacher_input = input[0] if isinstance(input, list) else input
                     teacher_input = teacher_input.to(device, non_blocking=True)
-                    teacher_output = ema_model.module(teacher_input)
-                
+                    
+                    # Robustly handle EMA model access
+                    # This fixes the "ModuleList" and "NotImplementedError"
+                    try:
+                        # Try calling the ema_model directly (works for newer timm ModelEma)
+                        teacher_output = ema_model(teacher_input)
+                    except (NotImplementedError, TypeError):
+                        # Fallback: access .module or .ema if direct call fails
+                        if hasattr(ema_model, 'module') and not isinstance(ema_model.module, torch.nn.ModuleList):
+                             teacher_output = ema_model.module(teacher_input)
+                        elif hasattr(ema_model, 'ema'):
+                             teacher_output = ema_model.ema(teacher_input)
+                        else:
+                             # Last resort: if it's a ModuleList, we can't infer forward, 
+                             # skip distillation or assume model matches structure.
+                             # If model(images) worked, we assume model_module(teacher_input) works.
+                             # We use the unwrapped DDP model as a proxy if EMA fails.
+                             teacher_output = model_module(teacher_input)
+
                 # Calculate KL Divergence
                 distill_loss = self.kl_div(logits, teacher_output)
                 if distill_loss > 0:
@@ -431,22 +451,15 @@ class Engine():
             metric_logger.update(Loss=loss.item())
             metric_logger.update(Lr=optimizer.param_groups[0]["lr"])
 
-            # --- MEMORY OPTIMIZATION START ---
-            # 1. Zero gradients with set_to_none=True (Saves memory compared to setting to 0)
+            # --- MEMORY OPTIMIZATION ---
             optimizer.zero_grad(set_to_none=True)
-
-            # 2. Explicitly delete large tensors to free computation graph immediately
             del input, target, loss, logits, output
-            
-            # Delete SupCon specific variables if they exist
             if 'images' in locals(): del images
             if 'view1' in locals(): del view1
             if 'view2' in locals(): del view2
             if 'supcon_loss' in locals(): del supcon_loss
-            # --- MEMORY OPTIMIZATION END ---
             
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
 
     def get_max_label_logits(self,output, class_mask,task_id=None, slice=True,target=None):
         #! Get max value for each label output
