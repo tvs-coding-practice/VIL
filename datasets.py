@@ -35,6 +35,20 @@ MEDICAL_TASKS_CONFIG = [
 ]
 
 
+class TwoCropTransform:
+    """Generate two different augmented views of the same image"""
+    def __init__(self, transform, strong_transform=None):
+        self.transform = transform
+        self.strong_transform = strong_transform if strong_transform is not None else transform
+
+    def __call__(self, x):
+        # View 1: Standard augmentation
+        v1 = self.transform(x)
+        # View 2: Strong augmentation (matches your manual logic)
+        v2 = self.strong_transform(x)
+        return [v1, v2]
+
+
 class Lambda(transforms.Lambda):
     def __init__(self, lambd, nb_classes):
         super().__init__(lambd)
@@ -444,6 +458,7 @@ def build_vil_scenario(splited_dataset, args):
 
 
 def build_transform(is_train, args):
+    # Base transform (Standard)
     if is_train:
         transform = transforms.Compose([
             transforms.Resize(256),
@@ -451,15 +466,30 @@ def build_transform(is_train, args):
             transforms.RandomRotation(degrees=10),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
     else:
         transform = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
+
+    # If using SupCon, we need to return two views
+    if is_train and args.use_supcon:
+        # Define the 'Strong' augmentation you were doing manually in engine.py
+        # Note: Gaussian noise is usually done on tensors, but standard transforms are cleaner.
+        strong_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.RandomCrop(224),
+            transforms.RandomRotation(degrees=10),
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1), # Stronger jitter
+            transforms.RandomErasing(p=0.2, scale=(0.02, 0.33)), # Replaces your manual erasing
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        return TwoCropTransform(transform, strong_transform)
+
     return transform
