@@ -217,6 +217,10 @@ class Engine():
         print(f"Added {len_new_nodes} nodes with label ({labels_to_be_added})")
         return new_head
     
+    def get_model_module(self, model):
+        if isinstance(model, (torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel)):
+            return model.module
+        return model
     
     def inference_acc(self,model,data_loader,device):
         print("Start detecting labels to be added...")
