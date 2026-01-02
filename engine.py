@@ -442,7 +442,8 @@ def train_one_epoch(self, model: torch.nn.Module,
             # --- MEMORY OPTIMIZATION END ---
             
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-                            
+
+
     def get_max_label_logits(self,output, class_mask,task_id=None, slice=True,target=None):
         #! Get max value for each label output
         correct=0
