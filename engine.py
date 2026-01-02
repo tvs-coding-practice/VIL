@@ -113,7 +113,7 @@ class ManualEMA:
 
         with torch.no_grad():
             # Iterate over both models simultaneously
-            for ema_v, model_v in zip(self.ema.state_dict().values(), model.state_dict().values()):
+            for ema_v, model_v in zip(self.ema_model.state_dict().values(), model.state_dict().values()):
                 
                 # Skip if one is a buffer and the other is a parameter (rare safety check)
                 if ema_v.device != model_v.device:
