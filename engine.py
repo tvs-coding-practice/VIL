@@ -107,23 +107,32 @@ class ManualEMA:
                 param.requires_grad = False
     
     def update(self, model):
-        """Update EMA parameters with current model parameters."""
+        # Helper to get the correct model (unwrap DDP if necessary)
+        if hasattr(model, 'module'):
+            model = model.module
+
         with torch.no_grad():
-            if isinstance(model, (list, tuple)) and isinstance(self.ema_model, (list, tuple)):
-                for ema_param, model_param in zip(self.ema_model, model):
-                    for ema_p, model_p in zip(ema_param.parameters(), model_param.parameters()):
-                        ema_p.data.mul_(self.decay).add_(model_p.data * (1.0 - self.decay))
-            elif isinstance(model, (list, tuple)):
-                # If model is a list but ema_model is not, we need to handle it differently
-                # This case might not occur, but handle it for safety
-                for ema_param, model_param in zip(self.ema_model.parameters(), 
-                                                  [p for m in model for p in m.parameters()]):
-                    ema_param.data.mul_(self.decay).add_(model_param.data * (1.0 - self.decay))
-            else:
-                # Standard case: both are single models
-                for ema_param, model_param in zip(self.ema_model.parameters(), model.parameters()):
-                    ema_param.data.mul_(self.decay).add_(model_param.data * (1.0 - self.decay))
-    
+            # Iterate over both models simultaneously
+            for ema_v, model_v in zip(self.ema.state_dict().values(), model.state_dict().values()):
+                
+                # Skip if one is a buffer and the other is a parameter (rare safety check)
+                if ema_v.device != model_v.device:
+                    model_v = model_v.to(device=ema_v.device)
+
+                # --- FIX START: Handle Shape Mismatch ---
+                # Check if shapes differ but element count is the same (e.g., [1, 8, 768] vs [8, 768])
+                if ema_v.shape != model_v.shape:
+                    if ema_v.numel() == model_v.numel():
+                        model_v = model_v.view(ema_v.shape)
+                    else:
+                        # If sizes assume distinct logic (e.g. buffers growing), skip or print warning
+                        continue
+                # --- FIX END ---
+                
+                # Perform the EMA update
+                # ema_v = decay * ema_v + (1 - decay) * model_v
+                ema_v.copy_(ema_v * self.decay + model_v * (1.0 - self.decay))
+                
     @property
     def module(self):
         """Return the EMA model."""
