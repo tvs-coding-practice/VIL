@@ -51,8 +51,7 @@ def main(args):
 
     # 3. Create Data Loaders
     print(f"Loading data for {args.dataset}...")
-    data_loader, class_mask = build_continual_dataloader(args)
-
+    data_loader, class_mask, class_group_size = build_continual_dataloader(args)
     # 4. Create Model
     print(f"Creating model: {args.model}")
     model = create_model(
