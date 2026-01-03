@@ -41,7 +41,8 @@ def supervised_contrastive_loss(features, labels, temperature=0.07):
     device = features.device
     batch_size = features.shape[0]
     
-    # Normalize features (should already be normalized, but ensure it)
+    # Normalize features (forward_projection already normalizes, but this is a safety check)
+    # Note: Normalizing twice is idempotent, so this is safe but slightly redundant
     features = F.normalize(features, p=2, dim=1)
     
     # Create mask for positive pairs (same class)
@@ -383,13 +384,15 @@ class Engine():
                 # Forward pass: Get features for SupCon and logits for classification
                 # Check if model has forward_projection method (SupCon-enabled model)
                 if hasattr(model_module, 'forward_projection'):
-                    # Get features from forward_features
+                    # Get features from forward_features (processes both views efficiently)
                     features = model_module.forward_features(images)
                     # Project features through projection head for SupCon
                     supcon_features = model_module.forward_projection(features)
                     # Get logits for classification (use view1 only for CE loss)
-                    logits_view1 = model_module.forward_head(model_module.forward_features(view1))
-                    logits = logits_view1
+                    # Extract view1 features from already computed features (more efficient)
+                    bs = view1.shape[0]
+                    features_view1 = features[:bs]  # First half is view1
+                    logits = model_module.forward_head(features_view1)
                 else:
                     # Fallback: Use regular forward (returns logits)
                     # This won't work properly for SupCon, but maintains compatibility
