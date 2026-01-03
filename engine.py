@@ -566,12 +566,14 @@ class Engine():
                 total_sum+=total
                 
                 if ema_model is not None:
-                    tmp_adapter = model.get_adapter()
-                    model.put_adapter(ema_model.module)
+                    # Unwrap model if it's wrapped in DataParallel/DDP
+                    model_module = self.get_model_module(model)
+                    tmp_adapter = model_module.get_adapter()
+                    model_module.put_adapter(ema_model.module)
                     output = model(input)
                     output,_,_ = self.get_max_label_logits(output, class_mask[task_id],slice=True) 
                     output_ema.append(output.softmax(dim=1))
-                    model.put_adapter(tmp_adapter)
+                    model_module.put_adapter(tmp_adapter)
                 
                 output = torch.stack(output_ema, dim=-1).max(dim=-1)[0]
                 
@@ -817,8 +819,10 @@ class Engine():
         optimizer = create_optimizer(args, model)
 
         with torch.no_grad():
-            if hasattr(model, 'get_adapter'):
-                prev_adapters = model.get_adapter()
+            # Unwrap model if it's wrapped in DataParallel/DDP
+            model_module = self.get_model_module(model)
+            if hasattr(model_module, 'get_adapter'):
+                prev_adapters = model_module.get_adapter()
                 self.prev_adapters = self.flatten_parameters(prev_adapters)
                 self.prev_adapters.requires_grad = False
 
@@ -850,8 +854,19 @@ class Engine():
                 if c != None:
                     for p in c.parameters():
                         p.requires_grad=False
-      
-        cur_adapters = model.get_adapter()
+
+        # Unwrap model if it's wrapped in DataParallel/DDP
+        model_module = self.get_model_module(model)
+        
+        if hasattr(model_module, 'get_adapter'):
+            cur_adapters = model_module.get_adapter()
+        else:
+            # Fallback: Manually filter for LoRA/Adapter/Prompt keys
+            print("[Engine] 'get_adapter' not found. Manually filtering state_dict...")
+            cur_adapters = {
+                k: v for k, v in model_module.state_dict().items()
+                if any(key in k for key in ['adapter', 'lora', 'prompt', 'head'])
+            }
         self.cur_adapters = self.flatten_parameters(cur_adapters)
         vector=self.cur_adapters - self.prev_adapters
         # if task_id>0: #? 1
@@ -873,7 +888,9 @@ class Engine():
                 optimizer = create_optimizer(args, model)
             
             if task_id == 1 and len(args.adapt_blocks) > 0:
-                ema_model = ManualEMA(model.get_adapter(), decay=args.ema_decay, device=device)
+                # Unwrap model if it's wrapped in DataParallel/DDP
+                model_module = self.get_model_module(model)
+                ema_model = ManualEMA(model_module.get_adapter(), decay=args.ema_decay, device=device)
             model, optimizer = self.pre_train_task(model, data_loader[task_id]['train'], device, task_id,args)
             for epoch in range(args.epochs):
                 model = self.pre_train_epoch(model=model, epoch=epoch, task_id=task_id, args=args,)

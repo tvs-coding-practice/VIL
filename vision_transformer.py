@@ -591,10 +591,16 @@ class VisionTransformer(nn.Module):
         Returns a ModuleList for compatibility with existing code.
         For LoRA, returns a ModuleList containing all LoRA modules.
         """
+        # Safety check: ensure adapt_blocks is initialized
+        if not hasattr(self, 'adapt_blocks') or self.adapt_blocks is None:
+            return nn.ModuleList([])
+        
         if self.use_lora:
             # Collect all LoRA modules from blocks
             lora_modules = []
             for i in self.adapt_blocks:
+                if i >= len(self.blocks):
+                    continue  # Skip invalid indices
                 block = self.blocks[i]
                 # Collect LoRA from attention (qkv and proj)
                 if hasattr(block.attn, 'qkv') and isinstance(block.attn.qkv, LoRALinear):
@@ -610,17 +616,23 @@ class VisionTransformer(nn.Module):
             return nn.ModuleList(lora_modules)
         else:
             # Legacy adapter support
-            return nn.ModuleList([self.blocks[i].adapter for i in self.adapt_blocks if hasattr(self.blocks[i], 'adapter')])
+            return nn.ModuleList([self.blocks[i].adapter for i in self.adapt_blocks if i < len(self.blocks) and hasattr(self.blocks[i], 'adapter')])
     
     def put_adapter(self, adapter):
         """
         Put adapters or LoRA parameters back into blocks.
         For LoRA, expects a ModuleList of LoRA modules in the same order as get_adapter.
         """
+        # Safety check: ensure adapt_blocks is initialized
+        if not hasattr(self, 'adapt_blocks') or self.adapt_blocks is None:
+            return
+        
         if self.use_lora:
             # Distribute LoRA modules back to blocks
             idx = 0
             for i in self.adapt_blocks:
+                if i >= len(self.blocks):
+                    continue  # Skip invalid indices
                 block = self.blocks[i]
                 # Restore LoRA to attention
                 if hasattr(block.attn, 'qkv') and isinstance(block.attn.qkv, LoRALinear):
@@ -644,7 +656,7 @@ class VisionTransformer(nn.Module):
         else:
             # Legacy adapter support
             for i, adapter_module in zip(self.adapt_blocks, adapter):
-                if hasattr(self.blocks[i], 'adapter'):
+                if i < len(self.blocks) and hasattr(self.blocks[i], 'adapter'):
                     self.blocks[i].adapter = adapter_module
     
     def init_weights(self, mode=''):
