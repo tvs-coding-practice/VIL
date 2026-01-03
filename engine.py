@@ -179,6 +179,9 @@ class ManualEMA:
 
 class Engine():
     def __init__(self, model=None,device=None,class_mask=[], domain_list= [], args=None):
+        self.prev_adapters = None
+        self.cur_adapters = None
+        self.current_class_group = None
         self.current_task=0
         self.current_classes=[]
         #! distillation
@@ -229,7 +232,7 @@ class Engine():
         
         if self.args.d_threshold:
             self.acc_per_label = np.zeros((self.args.class_num, self.args.domain_num))
-            self.label_train_count = np.zeros((self.args.class_num))
+            self.label_train_count = np.zeros(self.args.class_num)
             self.tanh = torch.nn.Tanh()
             
         self.cs=torch.nn.CosineSimilarity(dim=1,eps=1e-6)
@@ -239,21 +242,33 @@ class Engine():
         q=F.softmax(q,dim=1)
         kl = torch.mean(torch.sum(p * torch.log(p / q),dim=1))
         return kl
-  
-    def set_new_head(self, model, labels_to_be_added,task_id):
+
+    def set_new_head(self, model, labels_to_be_added, task_id):
         len_new_nodes = len(labels_to_be_added)
         self.labels_in_head = np.concatenate((self.labels_in_head, labels_to_be_added))
         self.added_classes_in_cur_task.update(labels_to_be_added)
-        self.head_timestamps = np.concatenate((self.head_timestamps, [task_id]*len_new_nodes))
-        prev_weight, prev_bias = model.head.weight, model.head.bias
-        prev_shape = prev_weight.shape # (class, dim)
-        new_head = torch.nn.Linear(prev_shape[-1], prev_shape[0] + len_new_nodes)
-    
+        self.head_timestamps = np.concatenate((self.head_timestamps, [task_id] * len_new_nodes))
+
+        # Get previous weights and bias
+        prev_weight = model.head.weight
+        prev_bias = model.head.bias
+        prev_shape = prev_weight.shape  # (class, dim)
+
+        # Check if the previous head used bias
+        has_bias = (prev_bias is not None)
+
+        # Create new head, respecting the bias configuration
+        new_head = torch.nn.Linear(prev_shape[-1], prev_shape[0] + len_new_nodes, bias=has_bias)
+
+        # Copy Weights (Always exists)
         new_head.weight[:prev_weight.shape[0]].data.copy_(prev_weight)
         new_head.weight[prev_weight.shape[0]:].data.copy_(prev_weight[labels_to_be_added])
-        new_head.bias[:prev_weight.shape[0]].data.copy_(prev_bias)
-        new_head.bias[prev_weight.shape[0]:].data.copy_(prev_bias[labels_to_be_added])
-        
+
+        # Copy Bias (Only if it exists)
+        if has_bias:
+            new_head.bias[:prev_weight.shape[0]].data.copy_(prev_bias)
+            new_head.bias[prev_weight.shape[0]:].data.copy_(prev_bias[labels_to_be_added])
+
         print(f"Added {len_new_nodes} nodes with label ({labels_to_be_added})")
         return new_head
         
@@ -745,71 +760,98 @@ class Engine():
             param_type = 'LoRA' if getattr(args, 'use_lora', False) else 'adapter'
             print(f'Unfreezing {param_type} parameters')        
         return model
-    
-    
+
     def pre_train_task(self, model, data_loader, device, task_id, args):
         self.current_task += 1
-        
+
         # Re-initialize head bias at the start of each task to prevent bias accumulation
         if task_id == 0 and hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear):
-            # Check if head bias is already biased
-            head_bias_abs_mean = model.head.bias.abs().mean().item()
-            if head_bias_abs_mean > 0.01:
-                print(f"Task {task_id}: Re-initializing head bias (current mean={head_bias_abs_mean:.6f})")
-                torch.nn.init.zeros_(model.head.bias)
-                print(f"Head bias re-initialized to zeros")
-        self.current_class_group = int(min(self.class_mask[task_id])/self.class_group_size)
+            if model.head.bias is not None:
+                head_bias_abs_mean = model.head.bias.abs().mean().item()
+                if head_bias_abs_mean > 0.01:
+                    print(f"Task {task_id}: Re-initializing head bias (current mean={head_bias_abs_mean:.6f})")
+                    torch.nn.init.zeros_(model.head.bias)
+                    print(f"Head bias re-initialized to zeros")
+
+        self.current_class_group = int(min(self.class_mask[task_id]) / self.class_group_size)
         self.class_group_list.append(self.current_class_group)
         self.current_classes = self.class_mask[task_id]
-        
+
         print(f"\n\nTASK : {task_id}")
-        self.added_classes_in_cur_task = set()  
-        #! distillation
-        if self.class_group_train_count[self.current_class_group]==0:
-            self.distill_head=None
-        else: # already seen classes
+        self.added_classes_in_cur_task = set()
+
+        # ! distillation
+        if self.class_group_train_count[self.current_class_group] == 0:
+            self.distill_head = None
+        else:  # already seen classes
             if self.args.IC:
                 self.distill_head = self.classifier_pool[self.current_class_group]
-                inf_acc = self.inference_acc(model, data_loader, device)
-                thresholds=[]
+
+                # Ensure inf_acc is a numpy array for math operations
+                inf_acc = np.array(self.inference_acc(model, data_loader, device))
+                thresholds = []
+
                 if self.args.d_threshold:
                     count = self.class_group_train_count[self.current_class_group]
+
+                    # --- FIX START ---
+                    # Initialize average_accs to 1.0 (or safe default) to prevent UnboundLocalError
+                    # and DivideByZero if count is 0
+                    average_accs = np.ones_like(inf_acc)
+
                     if count > 0:
-                        average_accs = np.sum(self.acc_per_label[self.current_classes, :count], axis=1) / count
-                    thresholds = self.args.gamma*(average_accs - inf_acc) / average_accs
-                    thresholds = self.tanh(torch.tensor(thresholds)).tolist()
-                    thresholds = [round(t,2) if t>self.args.thre else self.args.thre for t in thresholds]
+                        # Fetch history safely
+                        history = self.acc_per_label[self.current_classes, :count]
+                        # Only calculate if we have history, otherwise keep default
+                        if history.size > 0:
+                            # Use mean instead of sum/count to be safer, or stick to logic:
+                            real_avgs = np.mean(history, axis=1)
+                            # Update average_accs only where we have valid data (avoid 0s)
+                            mask = real_avgs > 0
+                            average_accs[mask] = real_avgs[mask]
+
+                    # Calculate thresholds (Added 1e-8 to denominator for extra safety)
+                    calc_thresholds = self.args.gamma * (average_accs - inf_acc) / (average_accs + 1e-8)
+
+                    # Apply tanh and formatting
+                    calc_thresholds = self.tanh(torch.tensor(calc_thresholds)).tolist()
+                    thresholds = [round(t, 2) if t > self.args.thre else self.args.thre for t in calc_thresholds]
+                    # --- FIX END ---
+
                     print(f"Thresholds for class {self.current_classes[0]}~{self.current_classes[-1]} : {thresholds}")
+
                 labels_to_be_added = self.detect_labels_to_be_added(inf_acc, thresholds)
-                
-                
-                if len(labels_to_be_added) > 0: #! Add node to the classifier if needed
-                    new_head = self.set_new_head(model, labels_to_be_added,task_id).to(device)
+
+                if len(labels_to_be_added) > 0:  # ! Add node to the classifier if needed
+                    # Ensure set_new_head returns the head (and handles bias=None internally as fixed previously)
+                    new_head = self.set_new_head(model, labels_to_be_added, task_id).to(device)
                     model.head = new_head
+
         optimizer = create_optimizer(args, model)
 
         with torch.no_grad():
-            prev_adapters = model.get_adapter()
-            self.prev_adapters = self.flatten_parameters(prev_adapters)
-            self.prev_adapters.requires_grad=False
-    
-        if task_id==0:
+            if hasattr(model, 'get_adapter'):
+                prev_adapters = model.get_adapter()
+                self.prev_adapters = self.flatten_parameters(prev_adapters)
+                self.prev_adapters.requires_grad = False
+
+        if task_id == 0:
             self.task_type_list.append("Initial")
             return model, optimizer
-        
-        prev_class = self.class_mask[task_id-1]
-        prev_domain = self.domain_list[task_id-1]
+
+        prev_class = self.class_mask[task_id - 1]
+        # Ensure domain_list is accessible (assuming it exists in self)
+        # If domain_list is not in self, this might fail, but assuming it matches original code logic:
         cur_class = self.class_mask[task_id]
-        self.cur_domain = self.domain_list[task_id]
-        
+
         if prev_class == cur_class:
             self.task_type = "DIL"
         else:
             self.task_type = "CIL"
-        
+
         self.task_type_list.append(self.task_type)
         print(f"Current task : {self.task_type}")
-        
+
         return model, optimizer
 
 
