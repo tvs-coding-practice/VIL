@@ -10,12 +10,10 @@ import torch.backends.cudnn as cudnn
 from pathlib import Path
 
 from timm.models import create_model
-from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
 
 from datasets import build_continual_dataloader
 from engine import Engine
-import models
 import utils
 import os
 
@@ -37,216 +35,168 @@ def set_data_config(args):
         args.domain_num = 3  # NIH, Brachio, Chexpert
     return args
 
+
 def main(args):
     # utils.init_distributed_mode(args)
     args.distributed = False
     args = set_data_config(args)
     device = torch.device(args.device)
 
-    # fix the seed for reproducibility
-    seed = args.seed
+    # 2. Reproducibility
+    seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-
     cudnn.benchmark = True
-    cudnn.deterministic = True
-    
-    data_loader, class_mask, domain_list = build_continual_dataloader(args)
-   
-    # -------------------------------------------------------------------------
-    # Model Creation
-    # -------------------------------------------------------------------------
+
+    # 3. Create Data Loaders
+    print(f"Loading data for {args.dataset}...")
+    data_loader, class_mask = build_continual_dataloader(args)
+
+    # 4. Create Model
     print(f"Creating model: {args.model}")
     model = create_model(
         args.model,
         pretrained=args.pretrained,
-        num_classes=args.nb_classes,
+        num_classes=args.class_num,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
-        adapt_blocks=args.adapt_blocks,
-        # Pass LoRA arguments to the model init
-        use_lora=args.use_lora,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha
     )
-
     model.to(device)
-    
-    # Initialize projection head for SupCon if enabled (AFTER moving model to device)
-    if args.use_supcon:
-        if hasattr(model, 'init_projection_head'):
-            model.init_projection_head(projection_dim=args.projection_dim)
-            # Ensure projection head is on the same device as the model
-            if model.projection_head is not None:
-                model.projection_head.to(device)
-            print(f"Initialized SupCon projection head with dimension {args.projection_dim} on device {device}")
-        else:
-            print("Warning: Model does not support projection head. SupCon will be disabled.")
-            args.use_supcon = False
-    
-    # Enable gradient checkpointing to save memory (trades compute for memory)
-    if hasattr(model, 'set_grad_checkpointing'):
-        model.set_grad_checkpointing(True)
-        print("Gradient checkpointing enabled to save memory")
 
-    # Initialize Engine
-    engine = Engine(model=model, device=device, class_mask=class_mask, domain_list=domain_list, args=args)
-    
-    # -------------------------------------------------------------------------
-    # Ensure head is properly initialized (especially after loading pretrained weights)
-    # -------------------------------------------------------------------------
-    if hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear):
-        # Check if head bias is all zeros (proper initialization) or has problematic values
-        head_bias_mean = model.head.bias.abs().mean().item()
-        head_weight_mean = model.head.weight.abs().mean().item()
-        
-        # If head seems improperly initialized (bias too large or weights too small), re-initialize
-        if head_bias_mean > 0.01 or head_weight_mean < 0.001:
-            print(f"Re-initializing head: bias_mean={head_bias_mean:.6f}, weight_mean={head_weight_mean:.6f}")
-            # Re-initialize head with proper values
-            torch.nn.init.trunc_normal_(model.head.weight, std=0.02)
-            torch.nn.init.zeros_(model.head.bias)
-            print(f"Head re-initialized: new bias_mean={model.head.bias.abs().mean().item():.6f}, "
-                  f"new weight_mean={model.head.weight.abs().mean().item():.6f}")
-    
-    # -------------------------------------------------------------------------
-    # Training Strategy: LoRA vs Adapters
-    # -------------------------------------------------------------------------
-    if args.use_lora:
-        # --- Strategy A: LoRA Training ---
-        print(f"LoRA Enabled (Rank={args.lora_rank}, Alpha={args.lora_alpha}).")
-        print("Freezing backbone. Unfreezing LoRA parameters, HEAD, and LAYER NORMS.")
-        
-        # 1. Freeze EVERYTHING first
-        for p in model.parameters():
-            p.requires_grad = False
-            
-        # 2. Unfreeze specific parts
-        trainable_params = []
-        for n, p in model.named_parameters():
-            if 'lora_' in n: # Matches lora_A and lora_B
-                p.requires_grad = True
-                trainable_params.append(n)
-            elif 'head' in n: # Always train the classifier head
-                if 'bias' in n:
-                    # Freeze head bias to prevent it from learning class bias
-                    # The model should learn from features, not bias
-                    p.requires_grad = False
-                    print(f"Freezing head bias: {n}")
-                else:
-                    p.requires_grad = True
-                    trainable_params.append(n)
-            elif 'projection_head' in n: # Train projection head for SupCon
-                p.requires_grad = True
-                trainable_params.append(n)
-            elif 'norm' in n: # <--- CRITICAL FIX: Train LayerNorms
-                p.requires_grad = True
-                trainable_params.append(n)
-        
-        print(f"Total trainable tensors: {len(trainable_params)}")
-
-    else:
-        # --- Strategy B: Original Adapter / Partial Fine-tuning ---
-        print("Standard Training: Using Adapters/Partial Freezing")
-        for n, p in model.named_parameters():
-            p.requires_grad = False
-            if 'adapter' in n:
-                p.requires_grad = True
-            if 'head' in n:
-                p.requires_grad = True
-
-    # Count parameters
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('Number of trainable params:', n_parameters)
-    
-    # Verify head is trainable
-    if hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear):
-        head_trainable = any(p.requires_grad for p in model.head.parameters())
-        print(f'Head is trainable: {head_trainable}')
-        if head_trainable:
-            head_params = sum(p.numel() for p in model.head.parameters() if p.requires_grad)
-            print(f'Head parameters: {head_params}')
-
-    # Create Optimizer and Scheduler
+    # 5. Create Engine & Optimizer
+    engine = Engine(args, model)
     optimizer = create_optimizer(args, model)
-    
-    # Verify head is in optimizer
-    if hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear):
-        head_in_optimizer = False
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                if id(p) == id(model.head.weight) or id(p) == id(model.head.bias):
-                    head_in_optimizer = True
-                    break
-            if head_in_optimizer:
-                break
-        print(f'Head parameters in optimizer: {head_in_optimizer}')
-        
-        # Separate head weights (not bias) into its own param group with lower LR
-        # Head bias is frozen, so we only need to handle weights
-        head_params = [p for p in model.head.parameters() if p.requires_grad]
-        if head_params:
-            # Remove head from existing param groups and add to new one with lower LR
-            base_lr = optimizer.param_groups[0]['lr']
-            head_lr = base_lr * 0.1  # 10x smaller LR for head
-            
-            # Remove head params from existing groups
-            for group in optimizer.param_groups:
-                group['params'] = [p for p in group['params'] 
-                                  if id(p) != id(model.head.weight) and id(p) != id(model.head.bias)]
-            
-            # Add head as separate param group with lower LR
-            optimizer.add_param_group({
-                'params': head_params, 
-                'lr': head_lr,
-                'weight_decay': optimizer.param_groups[0].get('weight_decay', 0.0)
-            })
-            print(f'Head parameters in separate param group with LR={head_lr:.6f} (10x smaller than base LR={base_lr:.6f})')
+    criterion = torch.nn.CrossEntropyLoss()
 
-    if args.sched != 'constant':
-        lr_scheduler, _ = create_scheduler(args, optimizer)
-    elif args.sched == 'constant':
-        lr_scheduler = None
-            
-    print(args)
-    
-    # -------------------------------------------------------------------------
-    # Evaluation Loop
-    # -------------------------------------------------------------------------
-    if args.eval:
-        acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
+    # 6. EMA Model Setup
+    ema_model = None
+    if args.model_ema:
+        # Assuming ManualEMA is in engine.py as per your uploads
+        from engine import ManualEMA
+        ema_model = ManualEMA(model, args.model_ema_decay, device)
 
-        for task_id in range(args.num_tasks):
-            checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))
-            if os.path.exists(checkpoint_path):
-                print('Loading checkpoint from:', checkpoint_path)
-                checkpoint = torch.load(checkpoint_path)
-                model.load_state_dict(checkpoint['model'])
+    # -------------------------------------------------------------------------
+    # RESUME & CHECKPOINT LOGIC
+    # -------------------------------------------------------------------------
+    start_task = 0
+    acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
+
+    # Directory to save checkpoints
+    ckpt_dir = os.path.join(args.output_dir, 'checkpoints')
+    Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+
+    # Search for the latest existing checkpoint (Iterate backwards)
+    print("Checking for existing checkpoints...")
+    for task_id in range(args.num_tasks - 1, -1, -1):
+        ckpt_path = os.path.join(ckpt_dir, f'task{task_id}_checkpoint.pth')
+
+        if os.path.exists(ckpt_path):
+            print(f"\n>>> Found checkpoint for Task {task_id}. Resuming from Task {task_id + 1}...")
+            checkpoint = torch.load(ckpt_path, map_location=device)
+
+            # A. Load Model & Optimizer
+            model.load_state_dict(checkpoint['model'])
+            # Note: We usually re-create the optimizer per task, but loading state is okay if supported
+            # optimizer.load_state_dict(checkpoint['optimizer'])
+
+            if ema_model is not None and 'ema_model' in checkpoint:
+                # Check if stored state is the inner model or wrapper
+                # If ManualEMA wrapper has .ema_model, load into that
+                if hasattr(ema_model, 'ema_model'):
+                    ema_model.ema_model.load_state_dict(checkpoint['ema_model'])
+                else:
+                    ema_model.load_state_dict(checkpoint['ema_model'])
+
+            # B. Restore Experiment Metrics (Acc Matrix)
+            if 'acc_matrix' in checkpoint:
+                acc_matrix = checkpoint['acc_matrix']
+
+            # C. Restore Engine State (Critical for Distillation/History)
+            if 'engine_state' in checkpoint:
+                es = checkpoint['engine_state']
+                # Restore critical engine variables so it "remembers" previous domains/classes
+                if hasattr(engine, 'current_task'): engine.current_task = es.get('current_task', task_id)
+                if hasattr(engine, 'class_group_train_count'): engine.class_group_train_count = es.get(
+                    'class_group_train_count', [])
+                if hasattr(engine, 'class_group_list'): engine.class_group_list = es.get('class_group_list', [])
+                if hasattr(engine, 'acc_per_label'): engine.acc_per_label = es.get('acc_per_label', None)
+                # Restore specialized sets if they exist
+                if hasattr(engine, 'added_classes_in_cur_task'): engine.added_classes_in_cur_task = es.get(
+                    'added_classes_in_cur_task', set())
             else:
-                print('No checkpoint found at:', checkpoint_path)
-                return
-            
-            _ = engine.evaluate_till_now(model, data_loader, device, 
-                                            task_id, class_mask, acc_matrix, args,)
-        return
-    
-    # -------------------------------------------------------------------------
-    # Training Loop
-    # -------------------------------------------------------------------------
-    criterion = torch.nn.CrossEntropyLoss().to(device)
+                # Fallback for old checkpoints: manually sync engine task counter
+                engine.current_task = task_id
 
-    print(f"Start training for {args.epochs} epochs")
+            # D. Print Past Results (So logs look complete)
+            print(f"\n=======================================================")
+            print(f"   Restored History (Tasks 0 to {task_id})")
+            print(f"=======================================================")
+            for t in range(task_id + 1):
+                acc = acc_matrix[t, t]
+                print(f"Task {t} : Best Accuracy = {acc:.2f}%")
+            print(f"=======================================================\n")
+
+            start_task = task_id + 1
+            break
+
+    if start_task >= args.num_tasks:
+        print("All tasks completed! Exiting.")
+        return
+
+    # -------------------------------------------------------------------------
+    # TRAINING LOOP
+    # -------------------------------------------------------------------------
     start_time = time.time()
 
-    engine.train_and_evaluate(model, criterion, data_loader, optimizer, 
-                              lr_scheduler, device, class_mask, args)
+    for task_id in range(start_task, args.num_tasks):
+        print(f"\n[Main] Starting Task {task_id} (Classes: {class_mask[task_id]})...")
+
+        # Run Training for this Task
+        model, optimizer = engine.train_and_evaluate(
+            model, criterion, data_loader, optimizer, device,
+            task_id, class_mask, acc_matrix, ema_model, args
+        )
+
+        # Save Checkpoint immediately after task finishes
+        if args.output_dir:
+            print(f"[Main] Saving checkpoint for Task {task_id}...")
+
+            # Capture Engine State for safer resuming
+            engine_state = {
+                'current_task': engine.current_task,
+                'class_group_train_count': getattr(engine, 'class_group_train_count', []),
+                'class_group_list': getattr(engine, 'class_group_list', []),
+                'acc_per_label': getattr(engine, 'acc_per_label', None),
+                'added_classes_in_cur_task': getattr(engine, 'added_classes_in_cur_task', set()),
+            }
+
+            save_dict = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': args.epochs,
+                'args': args,
+                'acc_matrix': acc_matrix,
+                'class_mask': class_mask,
+                'engine_state': engine_state
+            }
+
+            if ema_model is not None:
+                # Save the underlying model inside ManualEMA
+                if hasattr(ema_model, 'ema_model'):
+                    save_dict['ema_model'] = ema_model.ema_model.state_dict()
+                else:
+                    save_dict['ema_model'] = ema_model.state_dict()
+
+            torch.save(save_dict, os.path.join(ckpt_dir, f'task{task_id}_checkpoint.pth'))
+
+            # Also save the matrix separately for quick plotting
+            np.save(os.path.join(args.output_dir, 'acc_matrix.npy'), acc_matrix)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print(f"Total training time: {total_time_str}")
-
+    print(f'Training time {total_time_str}')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('LAE')
