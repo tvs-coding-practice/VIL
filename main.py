@@ -320,6 +320,9 @@ if __name__ == '__main__':
     parser.add_argument('--lora_alpha', type=int, default=16, help='Scaling factor for LoRA (default: 16)')
     parser.add_argument('--use_adapters', action='store_true', default=False, help='Use legacy Adapters instead of LoRA (deprecated)')
 
+    parser.add_argument('--model_ema', action='store_true', default=False, help='Enable EMA')
+    parser.add_argument('--model-ema-decay', type=float, default=0.9999, help='')
+    
     args = parser.parse_args()
     
     # LoRA is enabled by default unless --use_adapters is explicitly set
