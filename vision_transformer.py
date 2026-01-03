@@ -224,13 +224,17 @@ class LoRALinear(nn.Module):
         in_features = linear_layer.in_features
         out_features = linear_layer.out_features
         
-        self.lora_A = nn.Parameter(torch.randn(rank, in_features))
+        # Create LoRA matrices
+        # lora_A: initialized with kaiming_uniform (common practice)
+        # lora_B: initialized with zeros (standard LoRA practice - ensures no change at start)
+        self.lora_A = nn.Parameter(torch.empty(rank, in_features))
         self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         
         # Initialize LoRA weights
+        # Using kaiming_uniform for lora_A (alternative: normal with std=1/rank)
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B)
+        # lora_B is already zeros (correct initialization for LoRA)
     
     def forward(self, x):
         # Original forward pass
@@ -319,7 +323,6 @@ class LoRAMlp(nn.Module):
         x = self.drop1(x) if hasattr(self, 'drop1') else x
         x = self.fc2(x)
         x = self.drop2(x) if hasattr(self, 'drop2') else x
-        return x
         return x
 
 class Block(nn.Module):

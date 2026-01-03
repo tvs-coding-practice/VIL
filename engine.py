@@ -380,20 +380,28 @@ class Engine():
                 # Concatenate for single efficient forward pass: Shape [2*B, C, H, W]
                 images = torch.cat([view1, view2], dim=0)
                 
-                # Forward pass
-                output = model(images)
+                # Forward pass: Get features for SupCon and logits for classification
+                # Check if model has forward_projection method (SupCon-enabled model)
+                if hasattr(model_module, 'forward_projection'):
+                    # Get features from forward_features
+                    features = model_module.forward_features(images)
+                    # Project features through projection head for SupCon
+                    supcon_features = model_module.forward_projection(features)
+                    # Get logits for classification (use view1 only for CE loss)
+                    logits_view1 = model_module.forward_head(model_module.forward_features(view1))
+                    logits = logits_view1
+                else:
+                    # Fallback: Use regular forward (returns logits)
+                    # This won't work properly for SupCon, but maintains compatibility
+                    output = model(images)
+                    bs = view1.shape[0]
+                    logits = output[:bs]  # Logits for View 1
+                    supcon_features = output  # Use logits as features (not ideal, but works)
                 
-                # Split output back to [View1, View2] for specific losses
-                bs = view1.shape[0]
-                output1 = output[:bs] # Logits/Features for View 1
-                
-                # Calculate SupCon Loss
-                # We duplicate targets because we have 2 views per image in 'output'
+                # Calculate SupCon Loss using projected features
+                # We duplicate targets because we have 2 views per image
                 supcon_targets = torch.cat([target, target], dim=0)
-                supcon_loss = supervised_contrastive_loss(output, supcon_targets, temperature=args.supcon_temperature)
-                
-                # For Standard CE Loss and Accuracy, we use View 1 (Standard Augmentation)
-                logits = output1
+                supcon_loss = supervised_contrastive_loss(supcon_features, supcon_targets, temperature=args.supcon_temperature)
                 
             else:
                 # --- Standard Path (No SupCon) ---
@@ -712,9 +720,26 @@ class Engine():
     def flatten_parameters(self,modules):
         flattened_params = []
        
-        for m in modules:
-            params = list(m.parameters())
-            flattened_params.extend(params) 
+        # Handle dictionary case (fallback from state_dict filtering)
+        if isinstance(modules, dict):
+            # If it's a dict, values are tensors - flatten them directly
+            for v in modules.values():
+                if isinstance(v, torch.Tensor):
+                    flattened_params.append(v)
+        else:
+            # Handle module list/iterable case (normal get_adapter() return)
+            for m in modules:
+                if hasattr(m, 'parameters'):
+                    params = list(m.parameters())
+                    flattened_params.extend(params)
+                elif isinstance(m, torch.Tensor):
+                    # Handle case where module is actually a tensor
+                    flattened_params.append(m)
+        
+        if len(flattened_params) == 0:
+            # Return empty tensor with same dtype/device as model parameters
+            return torch.tensor([], dtype=torch.float32)
+        
         return torch.cat([param.view(-1) for param in flattened_params])
     
     def cluster_adapters(self):
@@ -859,7 +884,15 @@ class Engine():
         model_module = self.get_model_module(model)
         
         if hasattr(model_module, 'get_adapter'):
-            cur_adapters = model_module.get_adapter()
+            try:
+                cur_adapters = model_module.get_adapter()
+            except (AttributeError, IndexError) as e:
+                # Fallback if get_adapter() fails due to missing adapt_blocks or invalid indices
+                print(f"[Engine] 'get_adapter' failed: {e}. Manually filtering state_dict...")
+                cur_adapters = {
+                    k: v for k, v in model_module.state_dict().items()
+                    if any(key in k for key in ['adapter', 'lora', 'prompt', 'head'])
+                }
         else:
             # Fallback: Manually filter for LoRA/Adapter/Prompt keys
             print("[Engine] 'get_adapter' not found. Manually filtering state_dict...")

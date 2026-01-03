@@ -60,6 +60,11 @@ def main(args):
 
     # 4. Create Model
     print(f"Creating model: {args.model}")
+    # Prepare LoRA/Adapter parameters
+    adapt_blocks = getattr(args, 'adapt_blocks', [])
+    if not isinstance(adapt_blocks, list):
+        adapt_blocks = list(adapt_blocks) if hasattr(adapt_blocks, '__iter__') else []
+    
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -67,8 +72,22 @@ def main(args):
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
+        adapt_blocks=adapt_blocks,
+        use_lora=getattr(args, 'use_lora', False),
+        lora_rank=getattr(args, 'lora_rank', 8),
+        lora_alpha=getattr(args, 'lora_alpha', 16),
     )
     model.to(device)
+    
+    # Initialize projection head for SupCon if enabled
+    if getattr(args, 'use_supcon', False):
+        projection_dim = getattr(args, 'projection_dim', 128)
+        model_module = model.module if hasattr(model, 'module') else model
+        if hasattr(model_module, 'init_projection_head'):
+            model_module.init_projection_head(projection_dim=projection_dim)
+            print(f"[Main] Initialized SupCon projection head with dimension {projection_dim}")
+        else:
+            print("[Main] Warning: Model does not support SupCon projection head initialization")
 
     # 5. Create Engine & Optimizer
     # PASS the mask and domains to Engine
@@ -106,6 +125,15 @@ def main(args):
             model.load_state_dict(checkpoint['model'])
             # Note: We usually re-create the optimizer per task, but loading state is okay if supported
             # optimizer.load_state_dict(checkpoint['optimizer'])
+            
+            # Re-initialize projection head for SupCon if enabled (in case checkpoint doesn't have it)
+            if getattr(args, 'use_supcon', False):
+                projection_dim = getattr(args, 'projection_dim', 128)
+                model_module = model.module if hasattr(model, 'module') else model
+                if hasattr(model_module, 'init_projection_head'):
+                    if not hasattr(model_module, 'projection_head') or model_module.projection_head is None:
+                        model_module.init_projection_head(projection_dim=projection_dim)
+                        print(f"[Main] Re-initialized SupCon projection head after loading checkpoint")
 
             if ema_model is not None and 'ema_model' in checkpoint:
                 # Check if stored state is the inner model or wrapper
