@@ -159,10 +159,19 @@ def main(args):
     for task_id in range(start_task, args.num_tasks):
         print(f"\n[Main] Starting Task {task_id} (Classes: {class_mask[task_id]})...")
 
-        # Run Training for this Task
+        # New / Correct Call
+        # 1. Manually set task_id since the function doesn't accept it as an argument
+        engine.task_id = task_id
+        engine.current_task = task_id
+
+        # 2. Call with the exact parameters expected by engine.py
+        # Signature: (model, criterion, data_loader, optimizer, lr_scheduler, device, class_mask, args)
         model, optimizer = engine.train_and_evaluate(
-            model, criterion, data_loader, optimizer, device,
-            task_id, class_mask, acc_matrix, ema_model, args
+            model, criterion, data_loader, optimizer,
+            None,  # lr_scheduler (Required by engine, passing None)
+            device,
+            class_mask,
+            args
         )
 
         # Save Checkpoint immediately after task finishes
@@ -322,7 +331,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--model_ema', action='store_true', default=False, help='Enable EMA')
     parser.add_argument('--model-ema-decay', type=float, default=0.9999, help='')
-    
+
     args = parser.parse_args()
     
     # LoRA is enabled by default unless --use_adapters is explicitly set
