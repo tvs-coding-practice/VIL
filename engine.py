@@ -105,33 +105,64 @@ class ManualEMA:
             self.ema_model.eval()
             for param in self.ema_model.parameters():
                 param.requires_grad = False
-    
+
     def update(self, model):
-        # Helper to get the correct model (unwrap DDP if necessary)
+        # 1. Handle DDP/DataParallel wrapping
+        #    Unwrap the model so keys match self.ema_model (which is usually unwrapped)
         if hasattr(model, 'module'):
             model = model.module
 
-        with torch.no_grad():
-            # Iterate over both models simultaneously
-            for ema_v, model_v in zip(self.ema_model.state_dict().values(), model.state_dict().values()):
-                
-                # Skip if one is a buffer and the other is a parameter (rare safety check)
-                if ema_v.device != model_v.device:
-                    model_v = model_v.to(device=ema_v.device)
+        # 2. Determine if we are tracking the Full Model or just Adapters
+        #    We rely on the type of self.ema_model as the source of truth.
+        is_ema_list = isinstance(self.ema_model, (list, tuple))
 
-                # --- FIX START: Handle Shape Mismatch ---
-                # Check if shapes differ but element count is the same (e.g., [1, 8, 768] vs [8, 768])
-                if ema_v.shape != model_v.shape:
-                    if ema_v.numel() == model_v.numel():
-                        model_v = model_v.view(ema_v.shape)
-                    else:
-                        # If sizes assume distinct logic (e.g. buffers growing), skip or print warning
-                        continue
-                # --- FIX END ---
-                
-                # Perform the EMA update
-                # ema_v = decay * ema_v + (1 - decay) * model_v
-                ema_v.copy_(ema_v * self.decay + model_v * (1.0 - self.decay))
+        # 3. Select the correct source parameters from the current model
+        if is_ema_list and hasattr(model, 'get_adapter'):
+            source_part = model.get_adapter()
+        else:
+            source_part = model
+
+        # 4. Standardize Target (EMA) to a list
+        if is_ema_list:
+            target_list = self.ema_model
+        else:
+            target_list = [self.ema_model]
+
+        # 5. Standardize Source (Model) to a list
+        #    CRITICAL FIX: Explicitly convert nn.ModuleList to list to ensure zip works
+        if isinstance(source_part, (list, tuple)):
+            source_list = source_part
+        elif isinstance(source_part, torch.nn.ModuleList):
+            source_list = list(source_part)
+        else:
+            source_list = [source_part]
+
+        # 6. Iterate and Update
+        with torch.no_grad():
+            for target_mod, source_mod in zip(target_list, source_list):
+                # Get state dicts
+                source_state = source_mod.state_dict()
+                target_state = target_mod.state_dict()
+
+                for key in target_state:
+                    # Only update if key exists in source
+                    if key in source_state:
+                        ema_v = target_state[key]
+                        model_v = source_state[key]
+
+                        # Handle Device Mismatch (CPU EMA vs GPU Model)
+                        if ema_v.device != model_v.device:
+                            model_v = model_v.to(ema_v.device)
+
+                        # Handle Shape Mismatch (Rare, but possible with resizing)
+                        if ema_v.shape != model_v.shape:
+                            if ema_v.numel() == model_v.numel():
+                                model_v = model_v.view(ema_v.shape)
+                            else:
+                                continue  # Skip incompatible shapes
+
+                        # Execute EMA update: v_ema = decay * v_ema + (1-decay) * v_new
+                        ema_v.copy_(ema_v * self.decay + model_v * (1.0 - self.decay))
                 
     @property
     def module(self):
@@ -235,11 +266,16 @@ class Engine():
         with torch.no_grad():
             for batch_idx, (input, target) in enumerate(data_loader):
                 if self.args.develop:
-                    if batch_idx>200:
+                    if batch_idx > 200:
                         break
+
+                # FIX: Handle list input (SupCon/Contrastive views)
+                if isinstance(input, list):
+                    input = input[0]  # Take the first view for inference checking
+
                 input = input.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
-                
+
                 output = model(input)
                 
                 if output.shape[-1] > self.num_classes: # there are already added nodes till now
