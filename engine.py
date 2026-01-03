@@ -342,7 +342,7 @@ class Engine():
             return model.module
         return model
 
-    def train_one_epoch(self, model: torch.nn.Module, 
+    def train_one_epoch(self, model: torch.nn.Module,
                         criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer,
                         device: torch.device, epoch: int, max_norm: float = 0,
                         set_training_mode=True, task_id=-1, class_mask=None, ema_model = None, args = None):
@@ -511,7 +511,8 @@ class Engine():
 
             # --- MEMORY OPTIMIZATION ---
             optimizer.zero_grad(set_to_none=True)
-            del input, target, loss, logits, output
+            del input, target, loss, logits
+            if 'output' in locals(): del output  # <--- FIX: Check existence before delete
             if 'images' in locals(): del images
             if 'view1' in locals(): del view1
             if 'view2' in locals(): del view2
