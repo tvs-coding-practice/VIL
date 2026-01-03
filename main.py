@@ -14,6 +14,7 @@ from timm.optim import create_optimizer
 
 from datasets import build_continual_dataloader
 from engine import Engine
+import models
 import utils
 import os
 
