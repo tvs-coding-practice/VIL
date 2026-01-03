@@ -51,7 +51,13 @@ def main(args):
 
     # 3. Create Data Loaders
     print(f"Loading data for {args.dataset}...")
-    data_loader, class_mask, class_group_size = build_continual_dataloader(args)
+    # Capture all 3 returns: Loader, Mask, Domains
+    data_loader, class_mask, domain_list = build_continual_dataloader(args)
+
+    # Safety: If mask is empty (bug cause), force fill it
+    if len(class_mask) == 0:
+        class_mask = [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9, 10], [11, 12, 13]]
+
     # 4. Create Model
     print(f"Creating model: {args.model}")
     model = create_model(
@@ -65,7 +71,8 @@ def main(args):
     model.to(device)
 
     # 5. Create Engine & Optimizer
-    engine = Engine(args, model)
+    # PASS the mask and domains to Engine
+    engine = Engine(args, model, class_mask=class_mask, domain_list=domain_list)
     optimizer = create_optimizer(args, model)
     criterion = torch.nn.CrossEntropyLoss()
 

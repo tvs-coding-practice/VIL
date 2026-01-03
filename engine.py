@@ -178,64 +178,37 @@ class ManualEMA:
 
 
 class Engine():
-    def __init__(self, model=None,device=None,class_mask=[], domain_list= [], args=None):
-        self.prev_adapters = None
-        self.cur_adapters = None
-        self.current_class_group = None
-        self.current_task=0
-        self.current_classes=[]
-        #! distillation
-        self.class_group_num = 5
-        self.classifier_pool = [None for _ in range(self.class_group_num)]
-        self.class_group_train_count = [0 for _ in range(self.class_group_num)]
-        
-        self.task_num = len(class_mask)
-        self.class_group_size = len(class_mask[0])
-        self.distill_head= None
+    def __init__(self, args, model, class_mask=None, domain_list=None):
+        self.args = args
         self.model = model
-        
-        self.num_classes= max([item for mask in class_mask for item in mask])+1
-        self.labels_in_head = np.arange(self.num_classes)
-        self.added_classes_in_cur_task = set()
-        self.head_timestamps = np.zeros_like(self.labels_in_head)
-        self.args=args
-        
-        self.class_mask=class_mask
-        self.domain_list=domain_list
-        
-        # Create class name mapping for confusion matrix labels
-        # Try to get class names from args or use default mapping
-        self.class_names = {}
-        if hasattr(args, 'class_names') and args.class_names:
-            self.class_names = args.class_names
-        else:
-            # Default medical class mapping (can be overridden)
-            medical_class_map = {
-                0: 'Atelectasis', 1: 'Emphysema', 2: 'Cardiomegaly', 3: 'Pneumothorax',
-                4: 'Edema', 5: 'Infiltration', 6: 'Effusion', 7: 'Nodule', 8: 'No_Finding'
-            }
-            # Only include classes that are actually used
-            all_classes = set()
-            for mask in class_mask:
-                all_classes.update(mask)
-            self.class_names = {cls_id: medical_class_map.get(cls_id, f'Class_{cls_id}') 
-                               for cls_id in sorted(all_classes)}
+        self.optimizer = None
 
-        self.task_type="initial"
-        self.args=args
-        
-        self.adapter_vec=[]
-        self.task_type_list=[]
-        self.class_group_list=[]
-        self.adapter_vec_label=[]
-        self.device=device
-        
-        if self.args.d_threshold:
-            self.acc_per_label = np.zeros((self.args.class_num, self.args.domain_num))
-            self.label_train_count = np.zeros(self.args.class_num)
-            self.tanh = torch.nn.Tanh()
-            
-        self.cs=torch.nn.CosineSimilarity(dim=1,eps=1e-6)
+        # FIX: Use the data passed from main.py
+        if class_mask is not None:
+            self.class_mask = class_mask
+            self.domain_list = domain_list if domain_list is not None else []
+        else:
+            # Fallback (This is what was failing, we skip it now)
+            print("Warning: Reloading data inside Engine...")
+            from datasets import build_continual_dataloader
+            _, self.class_mask, self.domain_list = build_continual_dataloader(args)
+
+        # Safety Check to prevent IndexError
+        if len(self.class_mask) > 0:
+            self.class_group_size = len(self.class_mask[0])
+        else:
+            self.class_group_size = 1  # Default to avoid crash
+
+        self.num_tasks = args.num_tasks
+        self.task_id = 0
+        self.classifier_pool = [model.head]
+        self.num_classes = args.class_num
+        self.current_task = 0
+        self.known_classes = []
+        self.class_group_train_count = [0] * len(self.class_mask)
+        self.class_group_list = []
+        self.acc_per_label = None
+        self.added_classes_in_cur_task = set()
 
     def kl_div(self,p,q):
         p=F.softmax(p,dim=1)
