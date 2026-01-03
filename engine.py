@@ -183,21 +183,29 @@ class Engine():
         self.model = model
         self.optimizer = None
 
-        # FIX: Use the data passed from main.py
+        # Data Config
         if class_mask is not None:
             self.class_mask = class_mask
             self.domain_list = domain_list if domain_list is not None else []
         else:
-            # Fallback (This is what was failing, we skip it now)
-            print("Warning: Reloading data inside Engine...")
+            print("[Engine] Warning: class_mask not passed to Engine. Re-loading data...")
             from datasets import build_continual_dataloader
-            _, self.class_mask, self.domain_list = build_continual_dataloader(args)
+            try:
+                ret = build_continual_dataloader(args)
+                if len(ret) == 3:
+                    _, self.class_mask, self.domain_list = ret
+                else:
+                    _, self.class_mask = ret
+                    self.domain_list = []
+            except Exception as e:
+                print(f"[Engine] Error re-loading data: {e}")
+                self.class_mask = []
 
-        # Safety Check to prevent IndexError
+        # Safety Check
         if len(self.class_mask) > 0:
             self.class_group_size = len(self.class_mask[0])
         else:
-            self.class_group_size = 1  # Default to avoid crash
+            self.class_group_size = 1
 
         self.num_tasks = args.num_tasks
         self.task_id = 0
@@ -205,10 +213,16 @@ class Engine():
         self.num_classes = args.class_num
         self.current_task = 0
         self.known_classes = []
+
+        # Tracking variables
         self.class_group_train_count = [0] * len(self.class_mask)
         self.class_group_list = []
         self.acc_per_label = None
         self.added_classes_in_cur_task = set()
+
+        # --- FIX: Initialize the missing attribute ---
+        self.task_type_list = []
+        # ---------------------------------------------
 
     def kl_div(self,p,q):
         p=F.softmax(p,dim=1)
