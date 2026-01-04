@@ -228,13 +228,20 @@ class Engine():
         
     def inference_acc(self,model,data_loader,device):
         print("Start detecting labels to be added...")
+        if len(self.current_classes) == 0:
+            print("Warning: current_classes is empty, returning empty list")
+            return []
         accuracy_per_label = []
         correct_pred_per_label = [0 for i in range(len(self.current_classes))]
         num_instance_per_label = [0 for i in range(len(self.current_classes))]
         
+        if data_loader is None:
+            print("Warning: data_loader is None, returning zero accuracy for all labels")
+            return [0.0] * len(self.current_classes)
+        
         with torch.no_grad():
             for batch_idx, (input, target) in enumerate(data_loader):
-                if self.args.develop:
+                if hasattr(self.args, 'develop') and self.args.develop:
                     if batch_idx>200:
                         break
                 input = input.to(device, non_blocking=True)
@@ -257,7 +264,11 @@ class Engine():
                     correct_pred_per_label[i] += num_correct_pred.item()
                     num_instance_per_label[i] += sum(mask).item()
         for correct, num in zip (correct_pred_per_label, num_instance_per_label):
-            accuracy_per_label.append(round(correct/num,2))
+            if num > 0:
+                accuracy_per_label.append(round(correct/num,2))
+            else:
+                # If no instances for this label, set accuracy to 0.0
+                accuracy_per_label.append(0.0)
         return accuracy_per_label
     
     def detect_labels_to_be_added(self,inference_acc, thresholds=[]):
@@ -735,15 +746,29 @@ class Engine():
             if self.args.IC:
                 self.distill_head = self.classifier_pool[self.current_class_group]
                 inf_acc = self.inference_acc(model, data_loader, device)
+                # Convert inf_acc to numpy array for proper broadcasting
+                inf_acc = np.array(inf_acc)
+                # Validate that inf_acc has the correct length
+                if len(inf_acc) != len(self.current_classes):
+                    print(f"Warning: inf_acc length ({len(inf_acc)}) doesn't match current_classes length ({len(self.current_classes)})")
+                    # Pad or truncate to match
+                    if len(inf_acc) < len(self.current_classes):
+                        inf_acc = np.pad(inf_acc, (0, len(self.current_classes) - len(inf_acc)), 'constant', constant_values=0.0)
+                    else:
+                        inf_acc = inf_acc[:len(self.current_classes)]
                 thresholds=[]
                 if self.args.d_threshold:
                     count = self.class_group_train_count[self.current_class_group]
                     if count > 0:
                         average_accs = np.sum(self.acc_per_label[self.current_classes, :count], axis=1) / count
-                    thresholds = self.args.gamma*(average_accs - inf_acc) / average_accs
-                    thresholds = self.tanh(torch.tensor(thresholds)).tolist()
-                    thresholds = [round(t,2) if t>self.args.thre else self.args.thre for t in thresholds]
-                    print(f"Thresholds for class {self.current_classes[0]}~{self.current_classes[-1]} : {thresholds}")
+                        # Avoid division by zero: if average_accs is zero, use a small epsilon
+                        epsilon = 1e-8
+                        average_accs = np.where(average_accs == 0, epsilon, average_accs)
+                        thresholds = self.args.gamma*(average_accs - inf_acc) / average_accs
+                        thresholds = self.tanh(torch.tensor(thresholds)).tolist()
+                        thresholds = [round(t,2) if t>self.args.thre else self.args.thre for t in thresholds]
+                        print(f"Thresholds for class {self.current_classes[0]}~{self.current_classes[-1]} : {thresholds}")
+                    # If count is 0, thresholds remains empty list and static threshold will be used in detect_labels_to_be_added
                 labels_to_be_added = self.detect_labels_to_be_added(inf_acc, thresholds)
                 
                 
