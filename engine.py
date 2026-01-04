@@ -219,25 +219,22 @@ class Engine():
         self.class_group_train_count = [0] * len(self.class_mask)
         self.class_group_list = []
 
-        # --- FIX START: Initialize missing tracking variables ---
-
-        # 1. Fix for "no attribute 'adapter_vec'"
         self.adapter_vec = []
         self.adapter_vec_label = []
 
-        # 2. Fix for "acc_per_label" and "label_train_count"
-        # Initializing these now prevents errors in evaluate() and detection logic
+        self.labels_in_head = np.arange(self.num_classes)
+
+        self.head_timestamps = np.zeros(self.num_classes, dtype=int)
+
         self.label_train_count = np.zeros(self.num_classes)
         self.acc_per_label = np.zeros((self.num_classes, args.num_tasks))
 
-        # 3. Initialize prev_adapters to prevent error in first post_train_task
-        # (Used if args.use_cast_loss or similar logic checks previous adapters)
         self.prev_adapters = torch.tensor([], device=args.device)
 
-        # --------------------------------------------------------
+        self.task_type = "Initial"
+        self.task_type_list = []
 
         self.added_classes_in_cur_task = set()
-        self.task_type_list = []
 
     def kl_div(self,p,q):
         p=F.softmax(p,dim=1)
@@ -868,9 +865,6 @@ class Engine():
                 self.prev_adapters.requires_grad = False
 
         if task_id == 0:
-            # --- FIX: Set task_type here so it exists for post_train_task ---
-            self.task_type = "Initial"
-            # ----------------------------------------------------------------
             self.task_type_list.append("Initial")
             return model, optimizer
 
