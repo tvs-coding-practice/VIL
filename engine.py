@@ -567,7 +567,10 @@ class Engine():
                     print(f"  Output per-class mean: {output.mean(dim=0)[:min(5, output.shape[1])]}")
                     if hasattr(model, 'head') and isinstance(model.head, torch.nn.Linear):
                         print(f"  Head weight stats: min={model.head.weight.min().item():.4f}, max={model.head.weight.max().item():.4f}, mean={model.head.weight.mean().item():.4f}")
-                        print(f"  Head bias: {model.head.bias[:min(5, len(model.head.bias))]}")
+                        if model.head.bias is not None:
+                            print(f"  Head bias: {model.head.bias[:min(5, len(model.head.bias))]}")
+                        else:
+                            print(f"  Head bias: None (no bias)")
                 
                 output, correct, total = self.get_max_label_logits(output, class_mask[task_id],task_id=task_id, target=target,slice=True) 
                 output_ema = [output.softmax(dim=1)]
