@@ -819,22 +819,156 @@ class Engine():
         self.adapter_vec_label.append(self.task_type)
         self.cluster_adapters()
                  
+    def get_engine_state(self):
+        """Get the current state of the engine for checkpointing."""
+        # Save classifier pool state dicts (not the modules themselves)
+        classifier_pool_state = []
+        for c in self.classifier_pool:
+            if c is not None:
+                classifier_pool_state.append(c.state_dict())
+            else:
+                classifier_pool_state.append(None)
+        
+        engine_state = {
+            'current_task': self.current_task,
+            'classifier_pool_state': classifier_pool_state,
+            'class_group_train_count': self.class_group_train_count.copy(),
+            'class_group_list': self.class_group_list.copy(),
+            'task_type_list': self.task_type_list.copy(),
+            'adapter_vec_label': self.adapter_vec_label.copy(),
+        }
+        
+        # Handle adapter_vec - convert tensors to CPU and detach for serialization
+        if hasattr(self, 'adapter_vec') and len(self.adapter_vec) > 0:
+            adapter_vec_state = []
+            for v in self.adapter_vec:
+                if isinstance(v, torch.Tensor):
+                    adapter_vec_state.append(v.cpu().clone().detach())
+                else:
+                    adapter_vec_state.append(v)
+            engine_state['adapter_vec'] = adapter_vec_state
+        
+        if self.args.d_threshold:
+            engine_state['acc_per_label'] = self.acc_per_label.copy()
+            engine_state['label_train_count'] = self.label_train_count.copy()
+        return engine_state
+    
+    def load_engine_state(self, engine_state, model=None):
+        """Load engine state from checkpoint."""
+        self.current_task = engine_state.get('current_task', 0)
+        
+        # Restore classifier pool from state dicts
+        classifier_pool_state = engine_state.get('classifier_pool_state', [None] * self.class_group_num)
+        # Note: We'll restore classifier_pool when needed, as it requires the model head structure
+        # For now, we'll store the state dicts and restore them later if needed
+        self._classifier_pool_state_dicts = classifier_pool_state
+        
+        self.class_group_train_count = engine_state.get('class_group_train_count', [0] * self.class_group_num)
+        self.class_group_list = engine_state.get('class_group_list', [])
+        self.task_type_list = engine_state.get('task_type_list', [])
+        self.adapter_vec_label = engine_state.get('adapter_vec_label', [])
+        
+        if 'adapter_vec' in engine_state:
+            # Convert back to tensors on the correct device
+            adapter_vec_loaded = []
+            for v in engine_state['adapter_vec']:
+                if isinstance(v, torch.Tensor):
+                    adapter_vec_loaded.append(v.to(self.device))
+                else:
+                    adapter_vec_loaded.append(v)
+            self.adapter_vec = adapter_vec_loaded
+        
+        if self.args.d_threshold and 'acc_per_label' in engine_state:
+            self.acc_per_label = engine_state['acc_per_label']
+            self.label_train_count = engine_state.get('label_train_count', np.zeros((self.args.class_num)))
+        
+        print(f"Loaded engine state: current_task={self.current_task}, completed_tasks={len(self.task_type_list)}")
+        
+        # Restore classifier pool if we have the model and state dicts
+        if model is not None and hasattr(self, '_classifier_pool_state_dicts'):
+            for i, state_dict in enumerate(self._classifier_pool_state_dicts):
+                if state_dict is not None and self.classifier_pool[i] is not None:
+                    try:
+                        self.classifier_pool[i].load_state_dict(state_dict)
+                    except Exception as e:
+                        print(f"Warning: Could not restore classifier_pool[{i}]: {e}")
+
     def train_and_evaluate(self, model: torch.nn.Module, criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer, 
                         lr_scheduler, device: torch.device, class_mask=None, args = None,):
 
         # create matrix to save end-of-task accuracies 
         acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
         
+        # Check for existing checkpoints to resume from
+        start_task = 0
+        if args.output_dir and utils.is_main_process():
+            checkpoint_dir = os.path.join(args.output_dir, 'checkpoint')
+            # Find the highest completed task
+            for task_id in range(args.num_tasks - 1, -1, -1):
+                checkpoint_path = os.path.join(checkpoint_dir, f'task{task_id+1}_checkpoint.pth')
+                if os.path.exists(checkpoint_path):
+                    print(f"\n{'='*60}")
+                    print(f"Found checkpoint for Task {task_id+1}. Loading to resume training...")
+                    print(f"{'='*60}\n")
+                    checkpoint = torch.load(checkpoint_path, map_location=device)
+                    
+                    # Load model state
+                    model.load_state_dict(checkpoint['model'])
+                    if 'optimizer' in checkpoint:
+                        optimizer.load_state_dict(checkpoint['optimizer'])
+                    if 'ema_model' in checkpoint and checkpoint['ema_model'] is not None:
+                        # EMA model will be recreated if needed
+                        pass
+                    
+                    # Load engine state
+                    if 'engine_state' in checkpoint:
+                        self.load_engine_state(checkpoint['engine_state'], model=model)
+                        
+                        # Restore classifier_pool from state dicts after loading engine state
+                        if hasattr(self, '_classifier_pool_state_dicts'):
+                            for i, state_dict in enumerate(self._classifier_pool_state_dicts):
+                                if state_dict is not None:
+                                    # Recreate the classifier head if it doesn't exist
+                                    if self.classifier_pool[i] is None:
+                                        # We need to create a copy of model.head with the same structure
+                                        # This will be done when the classifier is actually used
+                                        pass
+                                    else:
+                                        try:
+                                            self.classifier_pool[i].load_state_dict(state_dict)
+                                        except Exception as e:
+                                            print(f"Warning: Could not restore classifier_pool[{i}]: {e}")
+                    
+                    # Load accuracy matrix if available
+                    if 'acc_matrix' in checkpoint:
+                        acc_matrix = checkpoint['acc_matrix']
+                        print(f"Loaded accuracy matrix from checkpoint")
+                        # Print previous task results
+                        print(f"\nPrevious Task Results:")
+                        print(f"Accuracy Matrix:")
+                        print(acc_matrix[:task_id+1, :task_id+1])
+                        if task_id >= 0:
+                            avg_acc = np.mean([acc_matrix[i, task_id] for i in range(task_id+1)])
+                            print(f"Average Accuracy: {avg_acc:.4f}")
+                    
+                    start_task = task_id + 1
+                    print(f"Resuming from Task {start_task} (Task {task_id+1} was completed)")
+                    break
+        
         ema_model = None
         
-        for task_id in range(args.num_tasks):
+        for task_id in range(start_task, args.num_tasks):
             # Create new optimizer for each task to clear optimizer status
             if task_id > 0 and args.reinit_optimizer:
                 optimizer = create_optimizer(args, model)
             
-            if task_id == 1 and len(args.adapt_blocks) > 0:
-                ema_model = ManualEMA(model.get_adapter(), decay=args.ema_decay, device=device)
             model, optimizer = self.pre_train_task(model, data_loader[task_id]['train'], device, task_id,args)
+            
+            # Create EMA model if needed (for task 1+ with adapters)
+            if task_id >= 1 and len(args.adapt_blocks) > 0 and ema_model is None:
+                ema_model = ManualEMA(model.get_adapter(), decay=args.ema_decay, device=device)
+            
+            train_stats = {}  # Initialize to avoid errors
             for epoch in range(args.epochs):
                 model = self.pre_train_epoch(model=model, epoch=epoch, task_id=task_id, args=args,)
                 train_stats = self.train_one_epoch(model=model, criterion=criterion, 
@@ -850,26 +984,81 @@ class Engine():
                 self.label_train_count[self.current_classes] += 1 
             test_stats = self.evaluate_till_now(model=model, data_loader=data_loader, device=device, 
                                         task_id=task_id, class_mask=class_mask, acc_matrix=acc_matrix, ema_model=ema_model, args=args)
+            
+            # Print and save task results
+            print(f"\n{'='*80}")
+            print(f"TASK {task_id+1} COMPLETED")
+            print(f"{'='*80}")
+            print(f"Task Type: {self.task_type}")
+            print(f"Current Classes: {self.current_classes}")
+            
+            # Print accuracy matrix for this task
+            print(f"\nAccuracy Matrix (row=task, col=eval_after_task):")
+            print(acc_matrix[:task_id+1, :task_id+1])
+            
+            # Calculate and print average accuracy
+            avg_acc = np.mean([acc_matrix[i, task_id] for i in range(task_id+1)])
+            print(f"\nAverage Accuracy across all tasks: {avg_acc:.4f}")
+            
+            if task_id > 0:
+                # Calculate forgetting
+                forgetting = np.mean([np.max(acc_matrix[i, :task_id+1]) - acc_matrix[i, task_id] 
+                                    for i in range(task_id)])
+                print(f"Forgetting: {forgetting:.4f}")
+            
+            print(f"{'='*80}\n")
+            
+            # Save checkpoint after each task
             if args.output_dir and utils.is_main_process():
                 Path(os.path.join(args.output_dir, 'checkpoint')).mkdir(parents=True, exist_ok=True)
                 
-                checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))
+                checkpoint_path = os.path.join(args.output_dir, 'checkpoint', f'task{task_id+1}_checkpoint.pth')
                 state_dict = {
                         'model': model.state_dict(),
                         'ema_model': ema_model.state_dict() if ema_model is not None else None,
                         'optimizer': optimizer.state_dict(),
-                        'epoch': epoch,
+                        'task_id': task_id,
                         'args': args,
+                        'engine_state': self.get_engine_state(),
+                        'acc_matrix': acc_matrix,
                     }
-                if args.sched is not None and args.sched != 'constant':
+                if args.sched is not None and args.sched != 'constant' and lr_scheduler is not None:
                     state_dict['lr_scheduler'] = lr_scheduler.state_dict()
                 
                 utils.save_on_master(state_dict, checkpoint_path)
+                print(f"Checkpoint saved: {checkpoint_path}")
+                
+                # Also save accuracy matrix separately for easy access
+                acc_matrix_path = os.path.join(args.output_dir, 'checkpoint', 'acc_matrix.npy')
+                np.save(acc_matrix_path, acc_matrix)
+                print(f"Accuracy matrix saved: {acc_matrix_path}")
 
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+            # Save detailed log stats
+            log_stats = {
+                'task_id': task_id,
+                'task_type': self.task_type,
+                'current_classes': self.current_classes.tolist() if isinstance(self.current_classes, np.ndarray) else self.current_classes,
+                **{f'train_{k}': v for k, v in train_stats.items()},
                 **{f'test_{k}': v for k, v in test_stats.items()},
-                'epoch': epoch,}
+                'acc_matrix': acc_matrix.tolist(),
+            }
+            
+            # Calculate summary statistics
+            if task_id >= 0:
+                avg_acc = np.mean([acc_matrix[i, task_id] for i in range(task_id+1)])
+                log_stats['avg_accuracy'] = float(avg_acc)
+                if task_id > 0:
+                    forgetting = np.mean([np.max(acc_matrix[i, :task_id+1]) - acc_matrix[i, task_id] 
+                                        for i in range(task_id)])
+                    log_stats['forgetting'] = float(forgetting)
 
             if args.output_dir and utils.is_main_process():
-                with open(os.path.join(args.output_dir, '{}_stats.txt'.format(datetime.datetime.now().strftime('log_%Y_%m_%d_%H_%M'))), 'a') as f:
+                log_file = os.path.join(args.output_dir, 'task_results.jsonl')
+                with open(log_file, 'a') as f:
+                    f.write(json.dumps(log_stats) + '\n')
+                print(f"Task results logged to: {log_file}")
+                
+                # Also save to timestamped file for backup
+                timestamped_log = os.path.join(args.output_dir, f'log_{datetime.datetime.now().strftime("%Y_%m_%d_%H_%M")}.jsonl')
+                with open(timestamped_log, 'a') as f:
                     f.write(json.dumps(log_stats) + '\n')
