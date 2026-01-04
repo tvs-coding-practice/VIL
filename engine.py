@@ -244,7 +244,14 @@ class Engine():
                 if hasattr(self.args, 'develop') and self.args.develop:
                     if batch_idx>200:
                         break
-                input = input.to(device, non_blocking=True)
+                
+                # Handle SupCon case where input is a list of two views
+                if isinstance(input, list):
+                    # For inference, we only need one view
+                    input = input[0].to(device, non_blocking=True)
+                else:
+                    input = input.to(device, non_blocking=True)
+                
                 target = target.to(device, non_blocking=True)
                 
                 output = model(input)
@@ -517,7 +524,13 @@ class Engine():
                     if batch_idx>20:
                         break
                 
-                input = input.to(device, non_blocking=True)
+                # Handle SupCon case where input is a list of two views
+                if isinstance(input, list):
+                    # For evaluation, we only need one view
+                    input = input[0].to(device, non_blocking=True)
+                else:
+                    input = input.to(device, non_blocking=True)
+                
                 target = target.to(device, non_blocking=True)
 
                 # compute output            
