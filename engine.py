@@ -214,14 +214,20 @@ class Engine():
         self.labels_in_head = np.concatenate((self.labels_in_head, labels_to_be_added))
         self.added_classes_in_cur_task.update(labels_to_be_added)
         self.head_timestamps = np.concatenate((self.head_timestamps, [task_id]*len_new_nodes))
-        prev_weight, prev_bias = model.head.weight, model.head.bias
+        prev_weight = model.head.weight
+        prev_bias = model.head.bias if model.head.bias is not None else None
         prev_shape = prev_weight.shape # (class, dim)
-        new_head = torch.nn.Linear(prev_shape[-1], prev_shape[0] + len_new_nodes)
+        
+        # Create new head with bias if the previous head had bias
+        new_head = torch.nn.Linear(prev_shape[-1], prev_shape[0] + len_new_nodes, bias=(prev_bias is not None))
     
         new_head.weight[:prev_weight.shape[0]].data.copy_(prev_weight)
         new_head.weight[prev_weight.shape[0]:].data.copy_(prev_weight[labels_to_be_added])
-        new_head.bias[:prev_weight.shape[0]].data.copy_(prev_bias)
-        new_head.bias[prev_weight.shape[0]:].data.copy_(prev_bias[labels_to_be_added])
+        
+        # Only copy bias if it exists
+        if prev_bias is not None:
+            new_head.bias[:prev_weight.shape[0]].data.copy_(prev_bias)
+            new_head.bias[prev_weight.shape[0]:].data.copy_(prev_bias[labels_to_be_added])
         
         print(f"Added {len_new_nodes} nodes with label ({labels_to_be_added})")
         return new_head
