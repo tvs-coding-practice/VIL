@@ -196,6 +196,11 @@ class Engine():
         self.adapter_vec_label=[]
         self.device=device
         
+        # Initialize clustering attributes
+        self.kmeans = None
+        self.cluster_assignments = None
+        self.adapter_vec_array = None
+        
         if self.args.d_threshold:
             self.acc_per_label = np.zeros((self.args.class_num, self.args.domain_num))
             self.label_train_count = np.zeros((self.args.class_num))
@@ -300,6 +305,13 @@ class Engine():
         return labels_with_low_accuracy
     
     def find_same_cluster_items(self,vec):
+        # If kmeans hasn't been initialized yet (first task or before clustering)
+        if self.kmeans is None or self.adapter_vec_array is None or len(self.adapter_vec) == 0:
+            # Return empty tensors - no clusters available yet
+            same_cluster_vecs = None
+            other_cluster_vecs = torch.empty(0, vec.shape[0], dtype=torch.float32).to(self.device)
+            return same_cluster_vecs, other_cluster_vecs
+        
         if self.kmeans.n_clusters == 1:
             other_cluster_vecs = self.adapter_vec_array
             other_cluster_vecs = torch.tensor(other_cluster_vecs,dtype=torch.float32).to(self.device)
@@ -417,14 +429,19 @@ class Engine():
                         _, other = self.find_same_cluster_items(diff_adapter)
                         sim = 0
                         
-                        weights = self.calculate_l2_distance(diff_adapter, other)
-                        for o, w in zip(other, weights):
-                            if self.args.norm_cast:
-                                sim += w * torch.matmul(diff_adapter, o) / (torch.norm(diff_adapter) * torch.norm(o))
-                            else:
-                                sim += w * torch.matmul(diff_adapter, o)
-                                
-                        orth_loss = args.beta * torch.abs(sim)
+                        # Only calculate distance if we have other cluster vectors
+                        if other is not None and len(other) > 0:
+                            weights = self.calculate_l2_distance(diff_adapter, other)
+                            for o, w in zip(other, weights):
+                                if self.args.norm_cast:
+                                    sim += w * torch.matmul(diff_adapter, o) / (torch.norm(diff_adapter) * torch.norm(o))
+                                else:
+                                    sim += w * torch.matmul(diff_adapter, o)
+                                    
+                            orth_loss = args.beta * torch.abs(sim)
+                        else:
+                            # No clusters available yet (first task), skip orthogonality loss
+                            orth_loss = torch.tensor(0.0, device=self.device)
                         if orth_loss > 0:
                             loss += orth_loss
 
