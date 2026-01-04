@@ -834,11 +834,10 @@ class Engine():
                     if count > 0:
                         # Fetch history safely
                         history = self.acc_per_label[self.current_classes, :count]
-                        # Only calculate if we have history, otherwise keep default
+                        # Only calculate if we have history
                         if history.size > 0:
-                            # Use mean instead of sum/count to be safer, or stick to logic:
                             real_avgs = np.mean(history, axis=1)
-                            # Update average_accs only where we have valid data (avoid 0s)
+                            # Update average_accs only where we have valid data
                             mask = real_avgs > 0
                             average_accs[mask] = real_avgs[mask]
 
@@ -848,14 +847,13 @@ class Engine():
                     # Apply tanh and formatting
                     calc_thresholds = self.tanh(torch.tensor(calc_thresholds)).tolist()
                     thresholds = [round(t, 2) if t > self.args.thre else self.args.thre for t in calc_thresholds]
-                    # --- FIX END ---
 
                     print(f"Thresholds for class {self.current_classes[0]}~{self.current_classes[-1]} : {thresholds}")
 
                 labels_to_be_added = self.detect_labels_to_be_added(inf_acc, thresholds)
 
                 if len(labels_to_be_added) > 0:  # ! Add node to the classifier if needed
-                    # Ensure set_new_head returns the head (and handles bias=None internally as fixed previously)
+                    # Ensure set_new_head returns the head
                     new_head = self.set_new_head(model, labels_to_be_added, task_id).to(device)
                     model.head = new_head
 
@@ -870,12 +868,13 @@ class Engine():
                 self.prev_adapters.requires_grad = False
 
         if task_id == 0:
+            # --- FIX: Set task_type here so it exists for post_train_task ---
+            self.task_type = "Initial"
+            # ----------------------------------------------------------------
             self.task_type_list.append("Initial")
             return model, optimizer
 
         prev_class = self.class_mask[task_id - 1]
-        # Ensure domain_list is accessible (assuming it exists in self)
-        # If domain_list is not in self, this might fail, but assuming it matches original code logic:
         cur_class = self.class_mask[task_id]
 
         if prev_class == cur_class:
