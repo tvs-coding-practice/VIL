@@ -923,7 +923,7 @@ class Engine():
                     print(f"\n{'='*60}")
                     print(f"Found checkpoint for Task {task_id+1}. Loading to resume training...")
                     print(f"{'='*60}\n")
-                    checkpoint = torch.load(checkpoint_path, map_location=device)
+                    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
                     
                     # Load model state
                     model.load_state_dict(checkpoint['model'])

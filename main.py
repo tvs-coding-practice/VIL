@@ -222,7 +222,7 @@ def main(args):
             checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))
             if os.path.exists(checkpoint_path):
                 print('Loading checkpoint from:', checkpoint_path)
-                checkpoint = torch.load(checkpoint_path)
+                checkpoint = torch.load(checkpoint_path, weights_only=False)
                 model.load_state_dict(checkpoint['model'])
             else:
                 print('No checkpoint found at:', checkpoint_path)
