@@ -251,7 +251,7 @@ class Adapter(nn.Module):
     def __init__(
         self,
         embed_dim: int,
-        down_sample: Union[float, int] = 5,
+        down_sample: Union[float, int] = 64,
         mode: str = "parallel",  # enum before, after, parallel
         scale: Optional[float] = None,
         act_layer = nn.GELU,
