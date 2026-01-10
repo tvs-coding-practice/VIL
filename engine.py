@@ -787,7 +787,18 @@ class Engine():
                 # Logits = H @ W_out
                 logits = torch.mm(projected, ranpac_learner.W_out)
                 
-                # 3. Calculate Metrics
+                # 3. Mask out unseen classes during evaluation (CRITICAL FIX for Acc@3)
+                # Get all classes seen up to current task
+                all_seen_classes_eval = []
+                for i in range(task_id + 1):
+                    all_seen_classes_eval.extend(self.class_mask[i])
+                all_seen_classes_eval = sorted(list(set(all_seen_classes_eval)))
+                not_seen_mask = np.setdiff1d(np.arange(ranpac_learner.num_classes), all_seen_classes_eval)
+                if len(not_seen_mask) > 0:
+                    not_seen_mask = torch.tensor(not_seen_mask, dtype=torch.int64).to(device)
+                    logits = logits.index_fill(dim=1, index=not_seen_mask, value=float('-inf'))
+                
+                # 4. Calculate Metrics
                 loss = torch.nn.functional.cross_entropy(logits, target)
                 acc1, acc3 = accuracy(logits, target, topk=(1, 3))
                 
