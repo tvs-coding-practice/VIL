@@ -378,20 +378,21 @@ class Engine():
                 # Concatenate for single efficient forward pass: Shape [2*B, C, H, W]
                 images = torch.cat([view1, view2], dim=0)
                 
-                # Forward pass
-                output = model(images)
+                # Forward pass: Get features before classification head
+                features = model_module.forward_features(images)  # [2*B, N, embed_dim]
                 
-                # Split output back to [View1, View2] for specific losses
+                # Get projection embeddings for SupCon loss (normalized to unit sphere)
+                projection_embeddings = model_module.forward_projection(features)  # [2*B, projection_dim]
+                
+                # Get classification logits for CE loss (only for view1)
                 bs = view1.shape[0]
-                output1 = output[:bs] # Logits/Features for View 1
+                features_view1 = features[:bs]  # [B, N, embed_dim]
+                logits = model_module.forward_head(features_view1)  # [B, num_classes]
                 
-                # Calculate SupCon Loss
-                # We duplicate targets because we have 2 views per image in 'output'
+                # Calculate SupCon Loss using projection embeddings (not classification logits!)
+                # We duplicate targets because we have 2 views per image
                 supcon_targets = torch.cat([target, target], dim=0)
-                supcon_loss = supervised_contrastive_loss(output, supcon_targets, temperature=args.supcon_temperature)
-                
-                # For Standard CE Loss and Accuracy, we use View 1 (Standard Augmentation)
-                logits = output1
+                supcon_loss = supervised_contrastive_loss(projection_embeddings, supcon_targets, temperature=args.supcon_temperature)
                 
             else:
                 # --- Standard Path (No SupCon) ---
