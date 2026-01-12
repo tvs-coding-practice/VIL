@@ -361,11 +361,13 @@ class Engine():
             # Initialize auxiliary losses
             distill_loss = 0
             supcon_loss = 0
+            is_supcon_path = False  # Track which path we took for cleanup
             
             # ------------------------------------------------------------------
             # 1. OPTIMIZED DATA LOADING & FORWARD PASS
             # ------------------------------------------------------------------
             if args.use_supcon and isinstance(input, list):
+                is_supcon_path = True
                 # --- SupCon Path (Parallelized Augmentation) ---
                 # Input is [view1, view2] from TwoCropTransform
                 view1, view2 = input
@@ -504,11 +506,21 @@ class Engine():
 
             # --- MEMORY OPTIMIZATION ---
             optimizer.zero_grad(set_to_none=True)
-            del input, target, loss, logits, output
-            if 'images' in locals(): del images
-            if 'view1' in locals(): del view1
-            if 'view2' in locals(): del view2
-            if 'supcon_loss' in locals(): del supcon_loss
+            # Clean up variables - delete common ones that always exist
+            del input, target, loss, logits
+            # Delete path-specific variables based on which path we took
+            if is_supcon_path:
+                # SupCon path variables
+                try:
+                    del images, view1, view2, supcon_loss, features, projection_embeddings, features_view1, supcon_targets
+                except NameError:
+                    pass
+            else:
+                # Standard path variable
+                try:
+                    del output
+                except NameError:
+                    pass
             
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
