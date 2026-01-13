@@ -579,7 +579,10 @@ class VisionTransformer(nn.Module):
         else:
             x = x[:, 0]  # Use CLS token
         
-        x = self.fc_norm(x)
+        # IMPORTANT: Don't use fc_norm here to avoid gradient conflicts with classification head
+        # The projection head should learn from raw features, not the same normalized features
+        # as the classification head. This allows both heads to learn complementary representations.
+        # The projection head will learn its own feature normalization through training.
         x = self.projection_head(x)
         # L2 normalize for contrastive learning
         x = F.normalize(x, p=2, dim=1)
