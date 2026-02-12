@@ -252,7 +252,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser('LAE')
 
     parser.add_argument('--batch-size', default=24, type=int, help='Batch size per device')
-    parser.add_argument('--epochs', default=5, type=int)
+    parser.add_argument('--epochs', default=25, type=int)
 
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL', help='Name of model to train')
