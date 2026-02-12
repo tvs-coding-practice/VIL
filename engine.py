@@ -802,6 +802,10 @@ class Engine():
                 loss = torch.nn.functional.cross_entropy(logits, target)
                 acc1, acc3 = accuracy(logits, target, topk=(1, 3))
                 
+                _, pred = torch.max(logits, 1)
+                all_preds.extend(pred.cpu().numpy())
+                all_targets.extend(target.cpu().numpy())
+                
                 metric_logger.meters['Loss'].update(loss.item())
                 metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
                 metric_logger.meters['Acc@3'].update(acc3.item(), n=input.shape[0])
@@ -810,6 +814,34 @@ class Engine():
         metric_logger.synchronize_between_processes()
         print('* Acc@1 {top1.global_avg:.3f} Acc@3 {top3.global_avg:.3f} loss {losses.global_avg:.3f}'
               .format(top1=metric_logger.meters['Acc@1'], top3=metric_logger.meters['Acc@3'], losses=metric_logger.meters['Loss']))
+        
+        # Compute and print confusion matrix
+        if len(all_preds) > 0 and len(all_targets) > 0:
+            preds_array = np.array(all_preds)
+            targets_array = np.array(all_targets)
+            unique_targets = np.unique(targets_array)
+            unique_preds = np.unique(preds_array)
+            classes_in_data = sorted(list(set(np.concatenate([unique_targets, unique_preds]))))
+            all_seen_classes = []
+            for i in range(task_id + 1):
+                all_seen_classes.extend(self.class_mask[i])
+            all_seen_classes = sorted(list(set(all_seen_classes)))
+            display_classes = sorted(list(set(classes_in_data + all_seen_classes)))
+            cm = confusion_matrix(targets_array, preds_array, labels=display_classes)
+            class_labels = [self.class_names.get(cls_id, f'Class_{cls_id}') for cls_id in display_classes]
+            print(f"\nConfusion Matrix for Task {task_id + 1} (RanPAC, all seen classes up to task {task_id + 1}):")
+            print(f"Total samples: {len(all_preds)}")
+            print("\nConfusion Matrix (rows=actual, cols=predicted):")
+            print(f"{'Actual \\ Predicted':<20}", end="")
+            for label in class_labels:
+                print(f"{label[:12]:>12}", end="")
+            print(f"{'Total':>10}")
+            for i, (label, row) in enumerate(zip(class_labels, cm)):
+                print(f"{label[:18]:<20}", end="")
+                for val in row:
+                    print(f"{val:>12}", end="")
+                print(f"{row.sum():>10}")
+            print()
         
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -830,15 +862,30 @@ class Engine():
             acc_matrix[i, task_id] = test_stats['Acc@1']
             
         avg_stat = np.divide(np.sum(stat_matrix, axis=1), task_id + 1)
+        diagonal = np.diag(acc_matrix)
+        avg_incremental_acc = np.mean(diagonal[:task_id + 1])
         
-        result_str = "[RanPAC Avg Task 0-{}]\tAcc@1: {:.4f}\tAcc@3: {:.4f}\tLoss: {:.4f}".format(
-            task_id, avg_stat[0], avg_stat[1], avg_stat[2])
+        # Print summary metrics
+        result_str = "[RanPAC Avg Task 0-{}]\tAcc@1: {:.4f}\tAcc@3: {:.4f}\tLoss: {:.4f}\tAvg-Incremental-Acc: {:.4f}".format(
+            task_id, avg_stat[0], avg_stat[1], avg_stat[2], avg_incremental_acc)
             
-        # Calculate Forgetting (if applicable, though RanPAC usually has zero forgetting if frozen)
         if task_id > 0:
-            diagonal = np.diag(acc_matrix)
             forgetting = np.mean((np.max(acc_matrix, axis=1) - acc_matrix[:, task_id])[:task_id])
-            result_str += "\tForgetting: {:.4f}".format(forgetting)
+            backward = np.mean((acc_matrix[:, task_id] - np.diag(acc_matrix))[:task_id])
+            result_str += "\tForgetting: {:.4f}\tBackward: {:.4f}".format(forgetting, backward)
             
         print(result_str)
+        
+        # Print task completion block (matches standard flow)
+        print(f"\n{'='*80}")
+        print(f"RanPAC TASK {task_id + 1} COMPLETED")
+        print(f"{'='*80}")
+        print(f"\nAccuracy Matrix (row=task, col=eval_after_task):")
+        print(acc_matrix[:task_id + 1, :task_id + 1])
+        print(f"\nAverage Accuracy across all tasks: {avg_stat[0]:.4f}")
+        print(f"Average Incremental Accuracy (diagonal): {avg_incremental_acc:.4f}")
+        if task_id > 0:
+            print(f"Forgetting: {np.mean((np.max(acc_matrix, axis=1) - acc_matrix[:, task_id])[:task_id]):.4f}")
+        print(f"{'='*80}\n")
+        
         return test_stats
