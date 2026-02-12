@@ -873,6 +873,9 @@ class Engine():
             forgetting = np.mean((np.max(acc_matrix, axis=1) - acc_matrix[:, task_id])[:task_id])
             backward = np.mean((acc_matrix[:, task_id] - np.diag(acc_matrix))[:task_id])
             result_str += "\tForgetting: {:.4f}\tBackward: {:.4f}".format(forgetting, backward)
+        else:
+            forgetting = None
+            backward = None
             
         print(result_str)
         
@@ -885,7 +888,8 @@ class Engine():
         print(f"\nAverage Accuracy across all tasks: {avg_stat[0]:.4f}")
         print(f"Average Incremental Accuracy (diagonal): {avg_incremental_acc:.4f}")
         if task_id > 0:
-            print(f"Forgetting: {np.mean((np.max(acc_matrix, axis=1) - acc_matrix[:, task_id])[:task_id]):.4f}")
+            print(f"Forgetting: {forgetting:.4f}")
+            print(f"Backward Transfer: {backward:.4f}")
         print(f"{'='*80}\n")
         
         return test_stats
