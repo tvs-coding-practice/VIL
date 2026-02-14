@@ -56,6 +56,12 @@ def main(args):
     data_loader, class_mask, domain_list = build_continual_dataloader(args)
    
 
+    pretrained_cfg_overlay = {}
+    if args.pretrained_path:
+        pretrained_cfg_overlay['file'] = args.pretrained_path
+        if not args.pretrained:
+            args.pretrained = True  # Enable loading when path is provided
+
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -64,6 +70,7 @@ def main(args):
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
         adapt_blocks=args.adapt_blocks,
+        pretrained_cfg_overlay=pretrained_cfg_overlay if pretrained_cfg_overlay else None,
     )
 
     model.to(device)
@@ -169,7 +176,8 @@ if __name__ == '__main__':
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL', help='Name of model to train')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
-    parser.add_argument('--pretrained', default=True, help='Load pretrained model or not')
+    parser.add_argument('--pretrained', default=True, action='store_true', help='Load pretrained model (default: True)')
+    parser.add_argument('--pretrained_path', default=None, type=str, help='Local path to pretrained .npz file (bypasses download; use when URL returns 403 on Kaggle)')
     parser.add_argument('--drop', type=float, default=0.0, metavar='PCT', help='Dropout rate (default: 0.)')
     parser.add_argument('--drop-path', type=float, default=0.0, metavar='PCT', help='Drop path rate (default: 0.)')
 

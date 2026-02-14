@@ -30,11 +30,15 @@ def _cfg(url='', **kwargs):
 @register_model
 def vit_base_patch16_224_in21k(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) from original paper (https://arxiv.org/abs/2010.11929).
-    ImageNet-1k weights fine-tuned from in21k @ 224x224, source https://github.com/google-research/vision_transformer.
+    ImageNet-21k pretrained @ 224x224. Uses HuggingFace Hub (google GCS url returns 403).
     """
+    # GCS url (https://storage.googleapis.com/vit_models/...) returns 403 Access Denied.
+    # Use timm's HuggingFace mirror instead (same arch, PyTorch state_dict format).
     default_cfg = _cfg(
-        url='https://storage.googleapis.com/vit_models/imagenet21k/ViT-B_16.npz',
-        custom_load=True,)
+        url='',  # Disabled - GCS no longer publicly accessible
+        hf_hub_id='timm/vit_base_patch16_224.augreg_in21k',
+        custom_load=False,
+    )
     kwargs.update(pretrained_cfg=default_cfg)
 
     model_args = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
@@ -46,11 +50,13 @@ def vit_base_patch16_224_in21k(pretrained=False, **kwargs):
 @register_model
 def vit_base_patch16_224(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) from original paper (https://arxiv.org/abs/2010.11929).
-    ImageNet-1k weights fine-tuned from in21k @ 224x224, source https://github.com/google-research/vision_transformer.
+    ImageNet-21k pretrained @ 224x224. Uses HuggingFace Hub (google GCS url returns 403).
     """
     default_cfg = _cfg(
-        url='https://storage.googleapis.com/vit_models/imagenet21k/ViT-B_16.npz',
-        custom_load=True,)
+        url='',  # Disabled - GCS no longer publicly accessible
+        hf_hub_id='timm/vit_base_patch16_224.augreg_in21k',
+        custom_load=False,
+    )
     kwargs.update(pretrained_cfg=default_cfg)
 
     model_args = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
