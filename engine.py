@@ -616,14 +616,11 @@ class Engine():
                 # Get predictions for confusion matrix (now restricted to seen classes)
                 _, pred = torch.max(output, 1)
                 
-                # Debug: Check prediction distribution
-                if batch_idx == 0 and task_id == 0:
-                    print(f"\n[DEBUG] After masking and processing:")
-                    print(f"  Output shape: {output.shape}")
-                    print(f"  Output min/max/mean: {output.min().item():.4f} / {output.max().item():.4f} / {output.mean().item():.4f}")
-                    print(f"  Output per-class mean: {output.mean(dim=0)}")
-                    print(f"  Predictions in batch: {torch.bincount(pred, minlength=output.shape[1])[:min(5, output.shape[1])]}")
-                    print(f"  Targets in batch: {torch.bincount(target, minlength=output.shape[1])[:min(5, output.shape[1])]}")
+                # Debug: Log pred vs target when evaluating in final stage (helps diagnose zero-acc)
+                if batch_idx == 0 and self.current_task >= 4:
+                    pred_dist = torch.bincount(pred, minlength=output.shape[1]).tolist()
+                    tgt_dist = torch.bincount(target, minlength=output.shape[1]).tolist()
+                    print(f"[Eval Task {task_id+1}] pred_dist: {pred_dist[:9]}, tgt_dist: {tgt_dist[:9]}")
                 
                 all_predictions.extend(pred.cpu().numpy())
                 all_targets.extend(target.cpu().numpy())
